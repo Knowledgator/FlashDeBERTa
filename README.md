@@ -40,6 +40,11 @@ input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to('cuda')
 outputs = model(input_ids)
 ```
 
+In order to switch to eager attention implementation, initialise a model in the following way:
+```python
+model = FlashDebertaV2Model.from_pretrained("microsoft/deberta-v3-base", _attn_implementation='eager').to('cuda')
+```
+
 ### Benchmarks
 
 While context-to-position and position-to-context biases still require quadratic memory, our flash attention implementation reduces overall memory requirements to nearly linear. This efficiency is particularly impactful for longer sequences. Starting from 512 tokens, FlashDeBERTa achieves more than a 50% performance improvement, and at 4k tokens, it's over 5 times faster than naive implementations.
