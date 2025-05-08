@@ -184,11 +184,15 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
         out = out.view(B, self.num_attention_heads, L, self.attention_head_size).transpose(1, 2).reshape(B, L, self.all_head_size)
         return (out, None)
 
+DEBERTA_SELF_ATTENTION_CLASSES = {
+    "eager": DisentangledSelfAttention,
+    "flash_attention": FlashDisentangledSelfAttention,
+}
 
 class FlashDebertaV2Attention(DebertaV2Attention):
     def __init__(self, config):
         super().__init__(config)
-        self.self = FlashDisentangledSelfAttention(config)
+        self.self = DEBERTA_SELF_ATTENTION_CLASSES[config._attn_implementation](config)
         self.output = DebertaV2SelfOutput(config)
         self.config = config
 
