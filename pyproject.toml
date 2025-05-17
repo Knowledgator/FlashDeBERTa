@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "flashDeBERTa"
-version = "0.0.3"
+version = "0.0.5"
 description = "Memory and compute efficient DeBERTa models."
 authors = ["knowledgator.com"]
 license = "Apache-2.0"
