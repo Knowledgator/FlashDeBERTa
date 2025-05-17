@@ -1,4 +1,5 @@
-from typing import Optional, Union, Tuple
+from typing import Optional, Union, Tuple, Dict
+import logging
 import math
 import torch
 from torch import nn
@@ -23,11 +24,14 @@ from transformers.models.deberta_v2.modeling_deberta_v2 import (DisentangledSelf
                                             LegacyDebertaV2LMPredictionHead,
                                             DebertaV2LMPredictionHead
                                             )
+from transformers.utils import logging
 
 from .padding import _upad_input, pad_input
 from .ops.flash_attention import flash_attention_with_disentangled
 from .ops.flash_attention_varlen import flash_attention_with_disentangled_varlen
 
+
+logger = logging.get_logger(__name__)
 
 class DebertaV2Config(PretrainedConfig):
     model_type = "deberta-v2"
@@ -328,6 +332,58 @@ class FlashDebertaV2PreTrainedModel(PreTrainedModel):
         elif isinstance(module, (LegacyDebertaV2LMPredictionHead, DebertaV2LMPredictionHead)):
             module.bias.data.zero_()
 
+    @classmethod
+    def _autoset_attn_implementation(
+        cls,
+        config,
+        use_flash_attention_2: bool = False,   
+        torch_dtype: Optional[torch.dtype] = None,
+        device_map: Optional[Union[str, Dict[str, int]]] = None,
+        check_device_map: bool = True,
+    ):
+        """
+        Decide which attention backend to use.
+        Priority
+        --------
+        1. Respect an explicit value already sitting in `config._attn_implementation`
+           (e.g. user passed `attn_implementation="sdpa"` to `from_pretrained`).
+        2. If `use_flash_attention_2=True` **and** a compatible GPU, dtype, and
+           flash-attn-2 kernels are available → choose `"flash_attention_2"`.
+        3. If PyTorch’s scaled-dot-product attention is available → `"sdpa"`.
+        4. Otherwise → `"eager"`.
+        """
+        if getattr(config, "_attn_implementation", None) and not getattr(
+            config, "_attn_implementation_autoset", False
+        ):
+            return config
+
+        torch_dtype = torch_dtype or getattr(config, "torch_dtype", None)
+
+        on_cuda = (
+            torch.cuda.is_available()
+            and (device_map is None or (isinstance(device_map, str) and device_map != "cpu"))
+        )
+
+        if (
+            use_flash_attention_2
+            and cls._supports_flash_attn_2
+            and on_cuda
+            and torch_dtype in (None, torch.float16, torch.bfloat16)
+        ):
+            config._attn_implementation = "flash_attention_2"
+            config._flash_attn_2_enabled = True
+            config._attn_implementation_autoset = True
+            return config
+        
+        if check_device_map and not on_cuda and torch.cuda.is_available():
+            logger.warning_once(
+                "FlashDeBERTa is being initialised on CPU. Move the model to GPU "
+                "with `model.to('cuda')` to benefit from Flash-Attention/SDPA."
+            )
+
+        config._attn_implementation = "eager"
+        config._attn_implementation_autoset = True
+        return config
 
 class FlashDebertaV2Model(FlashDebertaV2PreTrainedModel):
     def __init__(self, config):
