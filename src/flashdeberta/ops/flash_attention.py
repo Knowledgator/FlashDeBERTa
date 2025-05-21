@@ -3,6 +3,59 @@ import torch
 import triton
 import triton.language as tl
 
+def calculate_shared_memory_usage(BLOCK_M, BLOCK_N, BLOCK_DMODEL, num_stages, dtype, 
+                                 has_c2p=False, has_p2c=False, ATT_SPAN=0):
+    """
+    Calculate the shared memory requirements for Flash Attention with disentangled attention.
+    
+    Args:
+        BLOCK_M: Block size for query sequence dimension
+        BLOCK_N: Block size for key sequence dimension
+        BLOCK_DMODEL: Head dimension size
+        num_stages: Number of pipeline stages
+        dtype: Data type (torch.float16, torch.float32, etc.)
+        has_c2p: Whether content-to-position bias is used
+        has_p2c: Whether position-to-content bias is used
+        ATT_SPAN: Attention span for relative position
+    
+    Returns:
+        The estimated shared memory usage in bytes
+    """
+    # Determine byte size based on data type
+    if dtype == torch.float16:
+        dtype_size = 2
+    elif dtype == torch.float32:
+        dtype_size = 4
+    else:
+        dtype_size = 2  # Default to float16 size for other types
+
+    # Core tensors that are always used
+    q_size = BLOCK_M * BLOCK_DMODEL * dtype_size
+    k_size = BLOCK_N * BLOCK_DMODEL * dtype_size
+    v_size = BLOCK_N * BLOCK_DMODEL * dtype_size
+    
+    # Memory for attention scores and accumulator
+    attn_matrix_size = BLOCK_M * BLOCK_N * dtype_size
+    accumulator_size = BLOCK_M * BLOCK_DMODEL * dtype_size
+    
+    # Position embedding memory if needed
+    pos_memory = 0
+    if has_c2p:
+        pos_memory += BLOCK_M * 2 * ATT_SPAN * dtype_size
+    if has_p2c:
+        pos_memory += BLOCK_N * 2 * ATT_SPAN * dtype_size
+    
+    # Additional buffers for intermediate calculations
+    # This includes arrays for relative positions, bucket indices, etc.
+    additional_buffers = BLOCK_M * BLOCK_N * 4  # For relative position indices, floating-point calculations
+    
+    # Total memory per stage
+    memory_per_stage = q_size + k_size + v_size + attn_matrix_size + pos_memory + additional_buffers
+    
+    # Total shared memory including all pipeline stages
+    total_shared_memory = num_stages * memory_per_stage + accumulator_size
+    
+    return total_shared_memory // 5 # currently, overestimate by the factor of 5, so reduction is required
 
 def cdiv(a, b):
     return (a + b - 1) // b
@@ -163,7 +216,7 @@ def _fwd_kernel_deberta_disentangled_attention(
         tl.store(l_ptrs, l, mask=mask_m, cache_modifier=".cg")
         tl.store(o_ptrs, acc.to(q.dtype), mask=mask_m[:, None], cache_modifier=".cg")
 
-def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
+def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=None, att_span=256):
     """
     Determine optimal kernel configuration parameters.
 
@@ -171,13 +224,45 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
         B, H, M, N, D: Batch, head, query length, key length, per-head dimension.
         causal (bool): Whether causal masking is applied.
         disentangled (bool): Whether to use the DeBERTa-style disentangled attention kernel.
-                              This flag allows for small tweaks in configuration.
+        max_shared_memory (int, optional): Maximum available shared memory in bytes.
+                                         If None, it will be queried from the device.
 
     Returns:
         Tuple (BLOCK_M, BLOCK_N, num_stages, num_warps)
     """
-    capability = torch.cuda.get_device_capability()
-    if capability == (8, 0):
+    # See more details on the mapping at: https://forums.developer.nvidia.com/t/dynamic-shared-memory-calculated-by-ncu-larger-than-max-shared-memory-per-block/265589
+
+    capability_map = {
+         (5,0): 48000,
+         (5,2): 48000,
+         (5,3): 48000,
+         (6,0): 48000,
+         (6,1): 48000,
+         (6,2): 48000,
+         (7,0): 96000,
+         (7,2): 96000,
+         (7,5): 64000,
+         (8,0): 163000,
+         (8,6): 99000,
+         (8,7): 163000,
+         (8,9): 99000,
+         (9,0): 227000,
+         }
+    capability = torch.cuda.get_device_capability() 
+    
+    if capability in list(capability_map.keys()):
+        max_shared_memory = capability_map[capability] - 2000 # remove 2kb for ops overhead
+    
+    # if this is some unknown new arch -> default to minimal known for 8th 
+    elif capability[0] >= 8:
+        max_shared_memory = 99000 - 2000 # remove 2kb for ops overhead
+    # if this is some older unknown arch -> default to minimal known for < 8th
+    else:
+        max_shared_memory = 48000 - 2000 # remove 2kb for ops overhead
+
+    
+    # Start with an aggressive configuration
+    if capability[0] >= 8 :
         if not causal:
             if D <= 64:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
@@ -188,7 +273,6 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
         else:  # causal
             if D <= 64:
-                # When using disentangled attention, we may lower num_stages slightly.
                 if disentangled:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
                 else:
@@ -198,7 +282,7 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
                 else:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-    elif capability == (8, 6):
+    elif capability[0] == 8:
         if not causal:
             if D <= 64:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
@@ -206,7 +290,6 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
         else:  # causal
             if D <= 64:
-                # For (8,6) devices we boost BLOCK_M for disentangled relative attention.
                 if disentangled:
                     BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
                 else:
@@ -214,53 +297,70 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False):
             else:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
     else:
-        BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
+        BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 10, 4
+    
+    # Calculate shared memory usage with current config
+    has_pos = disentangled
+    ATT_SPAN = att_span if has_pos else 0 
+    
+    dtype = torch.float16
+
+    shared_mem_usage = calculate_shared_memory_usage(
+        BLOCK_M, BLOCK_N, D, num_stages, dtype, 
+        has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
+    )
+    
+    # If shared memory usage exceeds available, adjust parameters
+    # We prioritize reducing num_stages first, then block sizes
+
+    while shared_mem_usage > max_shared_memory and (BLOCK_M > 16 or BLOCK_N > 16 or num_stages > 1):
+        # First try reducing num_stages
+        if num_stages > 1:
+            num_stages -= 1
+        # Then try reducing block sizes
+        elif BLOCK_M > 32 and BLOCK_N > 32:
+            BLOCK_M //= 2
+            BLOCK_N //= 2
+        elif BLOCK_M > 32:
+            BLOCK_M //= 2
+        elif BLOCK_N > 32:
+            BLOCK_N //= 2
+        elif BLOCK_M > 16:
+            BLOCK_M //= 2
+        elif BLOCK_N > 16:
+            BLOCK_N //= 2
+        
+        # Recalculate with new parameters
+        shared_mem_usage = calculate_shared_memory_usage(
+            BLOCK_M, BLOCK_N, D, num_stages, dtype, 
+            has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
+        )
+    print(f"INFO: Forward config is {BLOCK_M}, {BLOCK_N}, {num_stages}, {num_warps} for BLOCK_M, BLOCK_N stages and warps, respectfully.")
+    print("INFO: If you want to change it, feel free to check ops/flash_attention")
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 
 def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_M, BLOCK_N,
-                           position_buckets, max_relative_distance, num_warps, num_stages):
+                           position_buckets, max_relative_distance, num_warps, num_stages, ATT_SPAN):
     """
     Performs the forward pass of FlashAttention with DeBERTa-style disentangled relative attention.
-
-    This function computes the attention output `o` and log-normalizer `L` for the input query (q),
-    key (k), and value (v) tensors. It supports disentangled relative attention using optional
-    positional projection matrices for content-to-position (C2P) and position-to-content (P2C) biases.
-
+    
     Args:
-        q (Tensor): Query tensor of shape (B, H, M, D) where
-            B = batch size, H = number of heads, M = query sequence length, D = head dimension.
-        k (Tensor): Key tensor of shape (B, H, N, D) where
-            N = key sequence length.
-        v (Tensor): Value tensor of shape (B, H, N, D).
-        pos_key (Tensor or None): Relative position embedding tensor for C2P bias with shape (2 * max_distance, D),
-            or None to disable content-to-position bias.
-        pos_query (Tensor or None): Relative position embedding tensor for P2C bias with shape (2 * max_distance, D),
-            or None to disable position-to-content bias.
-        causal (bool): If True, applies causal (autoregressive) masking to the attention weights.
-        sm_scale (float): Scaling factor applied to the dot-product attention scores.
-        BLOCK_M (int): Block size for splitting the query sequence dimension.
-        BLOCK_N (int): Block size for splitting the key sequence dimension.
-        position_buckets (int): Number of relative position buckets. If > 0, bucketing is applied.
-        max_relative_distance (int): Maximum relative distance used in bucketing or span window size.
-        num_warps (int): Number of warps used in the Triton kernel (hardware-specific parallelism).
-        num_stages (int): Number of pipeline stages in the Triton kernel.
-
-    Returns:
-        o (Tensor): Output attention tensor of shape (B, H, M, D), same shape as `q`.
-        L (Tensor): Log-sum-exp normalizer tensor of shape (B, H, M), used for numerically stable softmax.
-
-    Notes:
-        - This function utilizes a custom Triton kernel to efficiently compute block-sparse FlashAttention
-          with optional relative position biasing (both C2P and P2C).
-        - The relative attention mechanism supports DeBERTa's disentangled attention formulation, where
-          the attention bias is computed separately for position-query and key-position interactions.
-        - The number of relative position buckets and max distance determines the size and behavior
-          of the relative bias.
+        ... (existing arguments)
+        max_shared_memory (int, optional): Maximum available shared memory in bytes.
+                                          If None, it will be queried from the device.
     """
     B, H, M, D = q.shape
     N = k.shape[2]
     P_SEQ = N - M
+    
+    if sm_scale is None:
+        sm_scale = 1. / math.sqrt(D)
+    
+    # Determine if each bias term is present.
+    has_c2p = pos_key is not None
+    has_p2c = pos_query is not None
+
     larger_m = M > N
 
     divisible_m = (M % BLOCK_M) == 0
@@ -269,12 +369,6 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, causal, sm_scale, BLOCK_
     # Determine if each bias term is present.
     has_c2p = pos_key is not None
     has_p2c = pos_query is not None
-
-    # Determine ATT_SPAN from pos_key: assume shape is (2*ATT_SPAN, D)
-    if position_buckets>0:
-        ATT_SPAN = position_buckets
-    else:
-        ATT_SPAN = max_relative_distance
 
     # Setup grid: use a 3D grid (query blocks, heads, batch)
     grid = (cdiv(M, BLOCK_M), H, B)
@@ -329,12 +423,15 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         if sm_scale is None:
             sm_scale = 1. / math.sqrt(D)
         
-        config = get_fwd_config(B, H, M, N, D, causal, disentangled=True)
+        ATT_SPAN = position_buckets if position_buckets > 0 else max_relative_distance 
+        
+        config = get_fwd_config(B, H, M, N, D, causal, disentangled=True, att_span=ATT_SPAN)
+
         BLOCK_M, BLOCK_N, num_stages, num_warps = config
         
         o, L = flash_attn_v2_fwd_dise(q, k, v, q_pos, k_pos, causal, sm_scale,
                                       BLOCK_M, BLOCK_N, position_buckets,
-                                      max_relative_distance, num_warps, num_stages)
+                                      max_relative_distance, num_warps, num_stages, ATT_SPAN)
         return o
 
     @staticmethod
@@ -367,3 +464,4 @@ def flash_attention_with_disentangled(q, k, v, q_pos, k_pos, causal=False, sm_sc
     """
     return FlashAttentionDisentangled.apply(q, k, v, q_pos, k_pos, causal, sm_scale,
                                             position_buckets, max_relative_distance)
+

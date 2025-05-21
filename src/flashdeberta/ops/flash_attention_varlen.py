@@ -3,6 +3,66 @@ import torch
 import triton
 import triton.language as tl
 
+def calculate_shared_memory_usage_varlen(BLOCK_M, BLOCK_N, BLOCK_DMODEL, num_stages, dtype, 
+                                         has_c2p=False, has_p2c=False, ATT_SPAN=0):
+    """
+    Calculate the shared memory requirements for Flash Attention with disentangled attention
+    for variable-length sequences.
+    
+    Args:
+        BLOCK_M: Block size for query sequence dimension
+        BLOCK_N: Block size for key sequence dimension
+        BLOCK_DMODEL: Head dimension size
+        num_stages: Number of pipeline stages
+        dtype: Data type (torch.float16, torch.float32, etc.)
+        has_c2p: Whether content-to-position bias is used
+        has_p2c: Whether position-to-content bias is used
+        ATT_SPAN: Attention span for relative position
+    
+    Returns:
+        The estimated shared memory usage in bytes
+    """
+    # Determine byte size based on data type
+    if dtype == torch.float16:
+        dtype_size = 2
+    elif dtype == torch.float32:
+        dtype_size = 4
+    else:
+        dtype_size = 2  # Default to float16 size for other types
+
+    # Core tensors that are always used
+    q_size = BLOCK_M * BLOCK_DMODEL * dtype_size
+    k_size = BLOCK_N * BLOCK_DMODEL * dtype_size
+    v_size = BLOCK_N * BLOCK_DMODEL * dtype_size
+    
+    # Memory for attention scores and accumulator
+    attn_matrix_size = BLOCK_M * BLOCK_N * dtype_size
+    accumulator_size = BLOCK_M * BLOCK_DMODEL * dtype_size
+    
+    # Position embedding memory if needed
+    pos_memory = 0
+    if has_c2p:
+        pos_memory += BLOCK_M * 2 * ATT_SPAN * dtype_size
+    if has_p2c:
+        pos_memory += BLOCK_N * 2 * ATT_SPAN * dtype_size
+    
+    # Additional buffers for intermediate calculations
+    # This includes arrays for relative positions, bucket indices, etc.
+    additional_buffers = BLOCK_M * BLOCK_N * 4  # For relative position indices and calculations
+    
+    # For variable length, we need additional bookkeeping arrays
+    varlen_buffers = (BLOCK_M + BLOCK_N) * 4  # For sequence boundary tracking
+    
+    # Mid batch and mid start arrays (for batch mapping)
+    mid_batch_memory = BLOCK_M * 4  # Int32 array
+    
+    # Total memory per stage including variable length overhead
+    memory_per_stage = q_size + k_size + v_size + attn_matrix_size + pos_memory + additional_buffers + varlen_buffers
+    
+    # Total shared memory including all pipeline stages and bookkeeping
+    total_shared_memory = num_stages * memory_per_stage + accumulator_size + mid_batch_memory
+    
+    return total_shared_memory // 3 # higher overload to omit illegal mem access error; TODO: Remove overload by fixing the cause 
 
 def cdiv(a, b):
     return (a + b - 1) // b
@@ -164,42 +224,141 @@ def _fwd_kernel_deberta_disentangled_attention(
     tl.store(o_ptrs, acc.to(input_dtype), mask=mask_m[:, None], cache_modifier=".cg")
 
 
-def get_fwd_config(M, D, causal):
-    if torch.cuda.get_device_capability() == (8, 0):
+def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentangled=False, att_span=256):
+    """
+    Determine optimal kernel configuration parameters for variable-length sequences.
+
+    Args:
+        total_tokens: Total number of tokens across all batches
+        max_seqlen_q: Maximum query sequence length
+        max_seqlen_k: Maximum key sequence length
+        D: Per-head dimension
+        causal: Whether causal masking is applied
+        disentangled: Whether to use DeBERTa-style disentangled attention
+        att_span: Size of the attention span for relative positions
+
+    Returns:
+        Tuple (BLOCK_M, BLOCK_N, num_stages, num_warps)
+    """
+    # See more details on the mapping at: https://forums.developer.nvidia.com/t/dynamic-shared-memory-calculated-by-ncu-larger-than-max-shared-memory-per-block/265589
+
+    capability_map = {
+         (5,0): 48000,
+         (5,2): 48000,
+         (5,3): 48000,
+         (6,0): 48000,
+         (6,1): 48000,
+         (6,2): 48000,
+         (7,0): 96000,
+         (7,2): 96000,
+         (7,5): 64000,
+         (8,0): 163000,
+         (8,6): 99000,
+         (8,7): 163000,
+         (8,9): 99000,
+         (9,0): 227000,
+    }
+    
+    capability = torch.cuda.get_device_capability()
+    
+    if capability in list(capability_map.keys()):
+        max_shared_memory = capability_map[capability] - 2000  # Remove 2KB for ops overhead
+    # If this is some unknown new arch -> default to minimal known for 8th gen
+    elif capability[0] >= 8:
+        max_shared_memory = 99000 - 2000  # Remove 2KB for ops overhead
+    # If this is some older unknown arch -> default to minimal known for < 8th gen
+    else:
+        max_shared_memory = 48000 - 2000  # Remove 2KB for ops overhead
+    
+    # Start with an aggressive configuration
+    if capability[0] >= 8:
         if not causal:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
-            else:
-                if M <= 1024:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
-                else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-        else:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 4, 4
-            else:
-                if M <= 1024:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-                else:
-                    BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 128, 3, 8
-    elif torch.cuda.get_device_capability() == (8, 6):
-        if not causal:
-            if D <= 64:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
-            else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
-        else: # causal
             if D <= 64:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
             else:
-                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+                if max_seqlen_q <= 1024:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 8
+        else:  # causal
+            if D <= 64:
+                if disentangled:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 4, 4
+            else:
+                if max_seqlen_q <= 1024:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+                else:
+                    BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 8
+    elif capability[0] == 7:
+        if not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+        else:  # causal
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
     else:
-        BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
+        BLOCK_M, BLOCK_N, num_stages, num_warps = 16, 16, 1, 4
+    
+    # Additional adjustments for variable-length sequences
+    
+    # For very sparse batches (many short sequences), reduce block size
+    avg_seq_len = total_tokens / max(1, torch.cuda.device_count())
+    if avg_seq_len < 256:
+        BLOCK_M = min(BLOCK_M, 64)
+        BLOCK_N = min(BLOCK_N, 32)
+        num_stages = max(1, num_stages - 1)  # Reduce stages to save memory
+    
+    # Calculate shared memory usage with current config
+    has_pos = disentangled
+    ATT_SPAN = att_span if has_pos else 0
+    
+    dtype = torch.float16  # Assuming float16 is used as in original code
+    
+    shared_mem_usage = calculate_shared_memory_usage_varlen(
+        BLOCK_M, BLOCK_N, D, num_stages, dtype,
+        has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
+    )
+    
+    # If shared memory usage exceeds available, adjust parameters
+    # We prioritize reducing num_stages first, then block sizes
+    while shared_mem_usage > max_shared_memory and (BLOCK_M > 16 or BLOCK_N > 16 or num_stages > 1):
+        # First try reducing num_stages
+        if num_stages > 1:
+            num_stages -= 1
+        # Then try reducing block sizes
+        elif BLOCK_M > 32 and BLOCK_N > 32:
+            BLOCK_M //= 2
+            BLOCK_N //= 2
+        elif BLOCK_M > 32:
+            BLOCK_M //= 2
+        elif BLOCK_N > 32:
+            BLOCK_N //= 2
+        elif BLOCK_M > 16:
+            BLOCK_M //= 2
+        elif BLOCK_N > 16:
+            BLOCK_N //= 2
+        
+        # Recalculate with new parameters
+        shared_mem_usage = calculate_shared_memory_usage_varlen(
+            BLOCK_M, BLOCK_N, D, num_stages, dtype,
+            has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
+        )
+    
+    print(f"INFO: Variable-length forward config is {BLOCK_M}, {BLOCK_N}, {num_stages}, {num_warps} for BLOCK_M, BLOCK_N stages and warps, respectively.")
+    print("INFO: If you want to change it, feel free to check ops/flash_attention_varlen")
+    
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 
+
 def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, sm_scale, BLOCK_M, BLOCK_N,
-                           position_buckets, max_relative_distance, num_warps, num_stages):
+                           position_buckets, max_relative_distance, num_warps, num_stages, ATT_SPAN):
     """
     Performs the forward pass of FlashAttention with DeBERTa-style disentangled relative attention.
 
@@ -252,12 +411,6 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, cu_seqlens_q, cu_seqlens
     has_c2p = pos_key is not None
     has_p2c = pos_query is not None
 
-    # Determine ATT_SPAN from pos_key: assume shape is (2*ATT_SPAN, D)
-    if position_buckets>0:
-        ATT_SPAN = position_buckets
-    else:
-        ATT_SPAN = max_relative_distance
-
     grid = (MN, H)
     o = torch.empty_like(q)
     L = torch.empty((B, H, M), device=q.device, dtype=torch.float32)
@@ -309,19 +462,32 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         assert Dq == Dk == Dv
 
         BM, H, D = q.shape
-        B = len(cu_seqlens_q)-1
-        aM = BM//B
-
+        # B = len(cu_seqlens_q)-1
+        # aM = BM//B
+        
+        # Determine ATT_SPAN from pos_key: assume shape is (2*ATT_SPAN, D)
+        if position_buckets>0:
+            ATT_SPAN = position_buckets
+        else:
+            ATT_SPAN = max_relative_distance
+        
         if sm_scale is None:
             sm_scale = 1. / math.sqrt(D)
 
-        config = get_fwd_config(aM, D, causal)
+        config = get_fwd_config(total_tokens=BM, 
+                                max_seqlen_q=max_seqlen_q, 
+                                max_seqlen_k=max_seqlen_k, 
+                                D=D, 
+                                causal=causal, 
+                                disentangled=True, 
+                                att_span=ATT_SPAN)
+
         BLOCK_M, BLOCK_N, num_stages, num_warps = config
         
         o, L = flash_attn_v2_fwd_dise(q, k, v, q_pos, k_pos, cu_seqlens_q, cu_seqlens_k,
                                             max_seqlen_q, max_seqlen_k, causal, sm_scale,
                                             BLOCK_M, BLOCK_N, position_buckets,
-                                            max_relative_distance, num_warps, num_stages)
+                                            max_relative_distance, num_warps, num_stages, ATT_SPAN=ATT_SPAN)
         return o
 
     @staticmethod
@@ -356,3 +522,4 @@ def flash_attention_with_disentangled_varlen(q, k, v, q_pos, k_pos, cu_seqlens_q
     return FlashAttentionDisentangled.apply(q, k, v, q_pos, k_pos, cu_seqlens_q, cu_seqlens_k,
                                             max_seqlen_q, max_seqlen_k, causal, sm_scale,
                                             position_buckets, max_relative_distance)
+
