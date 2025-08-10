@@ -1,6 +1,7 @@
 import math
 import torch
 import triton
+import warnings
 import triton.language as tl
 
 def calculate_shared_memory_usage(BLOCK_M, BLOCK_N, BLOCK_DMODEL, num_stages, dtype, 
@@ -335,8 +336,8 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
             BLOCK_M, BLOCK_N, D, num_stages, dtype, 
             has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
         )
-    print(f"INFO: Forward config is {BLOCK_M}, {BLOCK_N}, {num_stages}, {num_warps} for BLOCK_M, BLOCK_N stages and warps, respectfully.")
-    print("INFO: If you want to change it, feel free to check ops/flash_attention")
+    warnings.warn(f"INFO: Variable-length forward config is {BLOCK_M}, {BLOCK_N}, {num_stages}, {num_warps} for BLOCK_M, BLOCK_N stages and warps, respectively.\n" /
+                  "INFO: If you want to change it, feel free to check ops/flash_attention_varlen")
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 
