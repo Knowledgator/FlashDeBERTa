@@ -63,7 +63,7 @@ def calculate_shared_memory_usage_varlen(BLOCK_M, BLOCK_N, BLOCK_DMODEL, num_sta
     # Total shared memory including all pipeline stages and bookkeeping
     total_shared_memory = num_stages * memory_per_stage + accumulator_size + mid_batch_memory
     
-    return total_shared_memory // 3 # higher overload to omit illegal mem access error; TODO: Remove overload by fixing the cause 
+    return total_shared_memory // 2
 
 def cdiv(a, b):
     return (a + b - 1) // b
@@ -244,12 +244,6 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
     # See more details on the mapping at: https://forums.developer.nvidia.com/t/dynamic-shared-memory-calculated-by-ncu-larger-than-max-shared-memory-per-block/265589
 
     capability_map = {
-         (5,0): 48000,
-         (5,2): 48000,
-         (5,3): 48000,
-         (6,0): 48000,
-         (6,1): 48000,
-         (6,2): 48000,
          (7,0): 96000,
          (7,2): 96000,
          (7,5): 64000,
@@ -258,18 +252,20 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
          (8,7): 163000,
          (8,9): 99000,
          (9,0): 227000,
-    }
+         }
     
-    capability = torch.cuda.get_device_capability()
-    
-    if capability in list(capability_map.keys()):
-        max_shared_memory = capability_map[capability] - 2000  # Remove 2KB for ops overhead
-    # If this is some unknown new arch -> default to minimal known for 8th gen
+    capability = torch.cuda.get_device_capability() 
+    device_property = torch.cuda.get_device_properties()
+    if hasattr(device_property,"shared_memory_per_block_optin"):
+        shared_mem_per_block = device_property.shared_memory_per_block_optin
+    elif capability in list(capability_map.keys()):
+        shared_mem_per_block = capability_map[capability]
     elif capability[0] >= 8:
-        max_shared_memory = 99000 - 2000  # Remove 2KB for ops overhead
-    # If this is some older unknown arch -> default to minimal known for < 8th gen
+        shared_mem_per_block = 99000
     else:
-        max_shared_memory = 48000 - 2000  # Remove 2KB for ops overhead
+        shared_mem_per_block = 48000
+
+    max_shared_memory = shared_mem_per_block - 2000 # remove 2kb for ops overhead
     
     # Start with an aggressive configuration
     if capability[0] >= 8:
@@ -333,16 +329,8 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
         if num_stages > 1:
             num_stages -= 1
         # Then try reducing block sizes
-        elif BLOCK_M > 32 and BLOCK_N > 32:
+        else:
             BLOCK_M //= 2
-            BLOCK_N //= 2
-        elif BLOCK_M > 32:
-            BLOCK_M //= 2
-        elif BLOCK_N > 32:
-            BLOCK_N //= 2
-        elif BLOCK_M > 16:
-            BLOCK_M //= 2
-        elif BLOCK_N > 16:
             BLOCK_N //= 2
         
         # Recalculate with new parameters
@@ -351,7 +339,7 @@ def get_fwd_config(total_tokens, max_seqlen_q, max_seqlen_k, D, causal, disentan
             has_c2p=has_pos, has_p2c=has_pos, ATT_SPAN=ATT_SPAN
         )
     
-    warnings.warn(f"INFO: Variable-length forward config is {BLOCK_M}, {BLOCK_N}, {num_stages}, {num_warps} for BLOCK_M, BLOCK_N stages and warps, respectively.\n" /
+    warnings.warn(f"INFO: Variable-length forward config is {BLOCK_M}, {BLOCK_N}, {num_stages}, {num_warps} for BLOCK_M, BLOCK_N stages and warps, respectively.\n"
                   "INFO: If you want to change it, feel free to check ops/flash_attention_varlen")
 
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
@@ -463,9 +451,7 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         assert Dq == Dk == Dv
 
         BM, H, D = q.shape
-        # B = len(cu_seqlens_q)-1
-        # aM = BM//B
-        
+
         # Determine ATT_SPAN from pos_key: assume shape is (2*ATT_SPAN, D)
         if position_buckets>0:
             ATT_SPAN = position_buckets
