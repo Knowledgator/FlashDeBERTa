@@ -181,20 +181,23 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
             pos_key, pos_query = None, None
 
         causal = False
-        if not varlen:
+        if not varlen or self.training:
+            seq_lengths = torch.sum(attention_mask, dim=1).contiguous()
+
             query_layer = transform(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
             key_layer = transform(key_layer, self.num_attention_heads)
             value_layer = transform(value_layer, self.num_attention_heads)
 
             if "c2p" in self.pos_att_type:
-                pos_key = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2))
+                pos_key = torch.matmul(query_layer, pos_key_layer.transpose(-1, -2)).contiguous()
             if "p2c" in self.pos_att_type:
-                pos_query = torch.matmul(key_layer, pos_query_layer.transpose(-1, -2))
+                pos_query = torch.matmul(key_layer, pos_query_layer.transpose(-1, -2)).contiguous()
 
             out = flash_attention_with_disentangled(
                 query_layer,
                 key_layer,
                 value_layer,
+                seq_lengths,
                 pos_key,
                 pos_query,
                 causal,
@@ -203,15 +206,15 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                 self.max_relative_positions,
             )
         else:
-            query_layer = get_heads(query_layer, self.num_attention_heads) # (B, L, NH, head_dim)
-            key_layer = get_heads(key_layer, self.num_attention_heads)
-            value_layer = get_heads(value_layer, self.num_attention_heads)
+            query_layer = get_heads(query_layer, self.num_attention_heads).contiguous() # (B, L, NH, head_dim)
+            key_layer = get_heads(key_layer, self.num_attention_heads).contiguous()
+            value_layer = get_heads(value_layer, self.num_attention_heads).contiguous()
 
             if "c2p" in self.pos_att_type:
                 # query_layer = (1, NH, L, head_dim)
-                pos_key = torch.einsum("bqhd,zhmd->bqhm", query_layer, pos_key_layer)
+                pos_key = torch.einsum("bqhd,zhmd->bqhm", query_layer, pos_key_layer).contiguous()
             if "p2c" in self.pos_att_type:
-                pos_query = torch.einsum("bqhd,zhmd->bqhm", key_layer, pos_query_layer)
+                pos_query = torch.einsum("bqhd,zhmd->bqhm", key_layer, pos_query_layer).contiguous()
 
             (query_layer, 
              key_layer,
@@ -234,9 +237,9 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
 
             out_unpad = flash_attention_with_disentangled_varlen(
-                query_layer,
-                key_layer,
-                value_layer,
+                query_layer.contiguous(),
+                key_layer.contiguous(),
+                value_layer.contiguous(),
                 pos_key,
                 pos_query,
                 cu_seqlens_q, cu_seqlens_k,
@@ -301,12 +304,6 @@ class FlashDebertaV2Encoder(DebertaV2Encoder):
         self.gradient_checkpointing = False
 
     def get_attention_mask(self, attention_mask):
-        if attention_mask.dim() <= 2:
-            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attention_mask = extended_attention_mask * extended_attention_mask.squeeze(-2).unsqueeze(-1)
-        elif attention_mask.dim() == 3:
-            attention_mask = attention_mask.unsqueeze(1)
-
         return attention_mask
 
 class FlashDebertaV2PreTrainedModel(PreTrainedModel):
