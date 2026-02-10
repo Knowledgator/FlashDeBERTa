@@ -784,9 +784,11 @@ def _bwd_kv_dise_kernel(
 
         if HAS_P2C:
             # Compute P2C gradients: ds_scaled is [BLOCK_M, BLOCK_N], need [BLOCK_N, BLOCK_M]
-            ds_scaled_t = ds_scaled.trans(1, 0)
+            # Cast to fp32 for atomic_add (bf16 not supported by Triton atomic operations)
+            ds_scaled_fp32 = ds_scaled.to(tl.float32)
+            ds_scaled_t_fp32 = ds_scaled_fp32.trans(1, 0)
             qpos_grad_ptrs = DQPOS + offs_n[:, None]*stride_pq2 + p2c_index_t*stride_pq3
-            tl.atomic_add(qpos_grad_ptrs, ds_scaled_t,
+            tl.atomic_add(qpos_grad_ptrs, ds_scaled_t_fp32,
                           mask=mask_n[:, None]&mask_m[None,:]&(p2c_index_t<2*ATT_SPAN),
                            sem="relaxed", scope="cta")
 
@@ -923,8 +925,10 @@ def _bwd_q_dise_kernel(
 
         if HAS_C2P:
             # Compute C2P gradients: ds_scaled is [BLOCK_M, BLOCK_N], matches K_POS indexing
+            # Cast to fp32 for atomic_add (bf16 not supported by Triton atomic operations)
+            ds_scaled_fp32 = ds_scaled.to(tl.float32)
             kpos_grad_ptrs = DKPOS + offs_m[:, None]*stride_pk2 + c2p_index*stride_pk3
-            tl.atomic_add(kpos_grad_ptrs, ds_scaled,
+            tl.atomic_add(kpos_grad_ptrs, ds_scaled_fp32,
                           mask=mask_m[:, None]&mask_n[None,:]&(c2p_index<2*ATT_SPAN),
                           sem="relaxed", scope="cta")
 
@@ -992,8 +996,9 @@ def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal,
 
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
-    dk_pos = torch.zeros_like(k_pos) if has_c2p else None
-    dq_pos = torch.zeros_like(q_pos) if has_p2c else None
+    # bf16 is not supported in atomic_add, so we always use fp32 for positional gradients
+    dk_pos = torch.zeros_like(k_pos, dtype=torch.float32) if has_c2p else None
+    dq_pos = torch.zeros_like(q_pos, dtype=torch.float32) if has_p2c else None
 
     if has_c2p:
         stride_pk0, stride_pk1, stride_pk2, stride_pk3 = k_pos.stride()

@@ -919,15 +919,20 @@ def _bwd_kv_dise_kernel_varlen(
 
         # positional grads: atomic adds
         if HAS_C2P:
+            # Cast to fp32 for atomic_add (bf16 not supported by Triton atomic operations)
+            ds_scaled_fp32 = ds_scaled.to(tl.float32)
             kpos_base = DKPOS + (offs_m_abs[:, None] * stride_pk0 + off_h * stride_pk1)
             kpos_ptrs = kpos_base + c2p_index * stride_pk2
-            tl.atomic_add(kpos_ptrs, ds_scaled, mask=mask_m[:, None] & mask_n[None, :] & (c2p_index < 2*ATT_SPAN),
+            tl.atomic_add(kpos_ptrs, ds_scaled_fp32, mask=mask_m[:, None] & mask_n[None, :] & (c2p_index < 2*ATT_SPAN),
                           sem="relaxed")
 
         if HAS_P2C:
+            # Cast to fp32 for atomic_add (bf16 not supported by Triton atomic operations)
+            ds_scaled_fp32 = ds_scaled.to(tl.float32)
+            ds_scaled_t_fp32 = ds_scaled_fp32.trans(1, 0)
             qpos_base = DQPOS + (offs_n_abs[:, None] * stride_pq0 + off_h * stride_pq1)
             qpos_ptrs = qpos_base + p2c_index * stride_pq2
-            tl.atomic_add(qpos_ptrs, ds_scaled.trans(1, 0),
+            tl.atomic_add(qpos_ptrs, ds_scaled_t_fp32,
                           mask=mask_n[:, None] & mask_m[None, :] & (p2c_index < 2*ATT_SPAN),
                           sem="relaxed")
 
@@ -1099,8 +1104,9 @@ def flash_attn_v2_bwd_dise_varlen(
 
     dk   = torch.empty_like(k)
     dv   = torch.empty_like(v)
-    dk_pos = torch.zeros_like(k_pos) if k_pos is not None else None
-    dq_pos = torch.zeros_like(q_pos) if q_pos is not None else None
+    # bf16 is not supported in atomic_add, so we always use fp32 for positional gradients
+    dk_pos = torch.zeros_like(k_pos, dtype=torch.float32) if k_pos is not None else None
+    dq_pos = torch.zeros_like(q_pos, dtype=torch.float32) if q_pos is not None else None
 
     has_c2p = k_pos is not None
     has_p2c = q_pos is not None
