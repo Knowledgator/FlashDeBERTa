@@ -332,7 +332,11 @@ def _fwd_kernel_deberta_disentangled_attention(
 
 
     if HAS_C2P:
-        k_pos_ptrs = K_POS + (offs_m[:, None] * stride_pk0 + off_h * stride_pk1)
+        # Positional tensors have a large token stride (H * 2 * ATT_SPAN).
+        # Keep their address arithmetic in int64 so large packed batches do
+        # not overflow 32-bit offsets even though cu_seqlens itself is int32.
+        offs_m_pos = offs_m.to(tl.int64)
+        k_pos_ptrs = K_POS + (offs_m_pos[:, None] * stride_pk0 + off_h * stride_pk1)
 
     for start_n in range(0, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -364,7 +368,7 @@ def _fwd_kernel_deberta_disentangled_attention(
             s += c2p_bias * sm_scale
 
         if HAS_P2C:
-            offs_n_abs = k_start + offs_n
+            offs_n_abs = (k_start + offs_n).to(tl.int64)
             current_q_pos_ptrs = Q_POS + (offs_n_abs[:, None] * stride_pq0 + off_h * stride_pq1)
             p2c_index = tl.minimum(tl.maximum(bucket_pos + ATT_SPAN, 0), 2 * ATT_SPAN - 1).to(tl.int32).trans(1, 0)
             q_pos_ptrs_ = current_q_pos_ptrs + p2c_index * stride_pq2
@@ -872,7 +876,8 @@ def _bwd_kv_dise_kernel_varlen(
         if HAS_C2P:
             c2p_index = tl.minimum(tl.maximum(bucket_pos + ATT_SPAN, 0), 2 * ATT_SPAN - 1).to(tl.int32)
             # K_POS layout: (BM, H, 2*ATT_SPAN), indexed by query row (offs_m_abs)
-            kpos_base = K_POS + (offs_m_abs[:, None] * stride_pk0 + off_h * stride_pk1)
+            offs_m_pos = offs_m_abs.to(tl.int64)
+            kpos_base = K_POS + (offs_m_pos[:, None] * stride_pk0 + off_h * stride_pk1)
             kpos_ptrs = kpos_base + c2p_index * stride_pk2
             c2p_bias = tl.load(kpos_ptrs, mask=mask_m[:, None] & (c2p_index < 2*ATT_SPAN), other=0.0)
             s += c2p_bias * sm_scale
@@ -880,7 +885,8 @@ def _bwd_kv_dise_kernel_varlen(
         if HAS_P2C:
             p2c_index = tl.minimum(tl.maximum(bucket_pos + ATT_SPAN, 0), 2 * ATT_SPAN - 1).to(tl.int32).trans(1, 0)
             # Q_POS layout: (BN, H, 2*ATT_SPAN), indexed by key row (offs_n_abs)
-            qpos_base = Q_POS + (offs_n_abs[:, None] * stride_pq0 + off_h * stride_pq1)
+            offs_n_pos = offs_n_abs.to(tl.int64)
+            qpos_base = Q_POS + (offs_n_pos[:, None] * stride_pq0 + off_h * stride_pq1)
             qpos_ptrs = qpos_base + p2c_index * stride_pq2
             p2c_bias = tl.load(qpos_ptrs, mask=mask_n[:, None] & (p2c_index < 2*ATT_SPAN), other=0.0).trans(1, 0)
             s += p2c_bias * sm_scale
@@ -1033,14 +1039,16 @@ def _bwd_q_dise_kernel_varlen(
 
         if HAS_C2P:
             c2p_index = tl.minimum(tl.maximum(bucket_pos + ATT_SPAN, 0), 2*ATT_SPAN - 1).to(tl.int32)
-            kpos_base = K_POS + (offs_m_abs[:, None] * stride_pk0 + off_h * stride_pk1)
+            offs_m_pos = offs_m_abs.to(tl.int64)
+            kpos_base = K_POS + (offs_m_pos[:, None] * stride_pk0 + off_h * stride_pk1)
             k_pos_ptrs = kpos_base + c2p_index * stride_pk2
             c2p_bias = tl.load(k_pos_ptrs, mask=mask_m[:, None] & (c2p_index < 2*ATT_SPAN), other=0.0)
             s += c2p_bias * sm_scale
 
         if HAS_P2C:
             p2c_index = tl.minimum(tl.maximum(bucket_pos + ATT_SPAN, 0), 2*ATT_SPAN - 1).to(tl.int32).trans(1, 0)
-            qpos_base = Q_POS + (offs_n_abs[:, None] * stride_pq0 + off_h * stride_pq1)
+            offs_n_pos = offs_n_abs.to(tl.int64)
+            qpos_base = Q_POS + (offs_n_pos[:, None] * stride_pq0 + off_h * stride_pq1)
             q_pos_ptrs = qpos_base + p2c_index * stride_pq2
             p2c_bias = tl.load(q_pos_ptrs, mask=mask_n[:, None] & (p2c_index < 2*ATT_SPAN), other=0.0).trans(1, 0)
             s += p2c_bias * sm_scale
