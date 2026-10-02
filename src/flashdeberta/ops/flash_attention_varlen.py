@@ -159,6 +159,12 @@ def _fwd_kernel_deberta_disentangled_attention(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
+    # Packed position scores span (tokens, H, 2 * ATT_SPAN): keep their offsets in int64.
+    if HAS_C2P:
+        k_pos_rows = K_POS + off_h.to(tl.int64) * stride_pk1 + offs_m.to(tl.int64) * stride_pk0
+    if HAS_P2C:
+        Q_POS += off_h.to(tl.int64) * stride_pq1
+
     k_ptrs = K + (offs_k[:, None] * stride_kk + (k_start + offs_n_base)[None, :] * stride_kz + off_h * stride_kh)
     v_ptrs = V + ((k_start + offs_n_base)[:, None] * stride_vz + off_h * stride_vh + offs_k[None, :] * stride_vk)
 
@@ -177,10 +183,9 @@ def _fwd_kernel_deberta_disentangled_attention(
             # Slot of every (query, key) pair from the distance lookup table.
             slot = tl.load(POS_LUT + (offs_m_rel[:, None] - offs_n[None, :] + MAX_N - 1), mask=valid, other=0)
         if HAS_C2P:
-            s += tl.load(K_POS + offs_m[:, None] * stride_pk0 + off_h * stride_pk1 + slot * stride_pk2,
-                         mask=valid, other=0.0).to(tl.float32)
+            s += tl.load(k_pos_rows[:, None] + slot * stride_pk2, mask=valid, other=0.0).to(tl.float32)
         if HAS_P2C:
-            s += tl.load(Q_POS + (k_start + offs_n)[None, :] * stride_pq0 + off_h * stride_pq1 + slot * stride_pq2,
+            s += tl.load(Q_POS + (k_start + offs_n).to(tl.int64)[None, :] * stride_pq0 + slot * stride_pq2,
                          mask=valid, other=0.0).to(tl.float32)
 
         s = s * qk_scale
@@ -383,8 +388,12 @@ def _bwd_kv_dise_kernel_varlen(
     # P2C gradients of distances saturated into the first/last slot, per key row.
     low_sum = tl.zeros([BLOCK_N], dtype=tl.float32)
     high_sum = tl.zeros([BLOCK_N], dtype=tl.float32)
+    # Packed position scores and bands span all tokens: keep their offsets in int64.
+    if HAS_C2P:
+        K_POS += off_h.to(tl.int64) * stride_pk1
     if HAS_P2C:
-        P2C_BAND += off_h.to(tl.int64) * stride_band_h
+        q_pos_rows = Q_POS + off_h.to(tl.int64) * stride_pq1 + offs_n_abs.to(tl.int64) * stride_pq0
+        band_rows = P2C_BAND + off_h.to(tl.int64) * stride_band_h + offs_n_abs.to(tl.int64) * NUM_COLUMNS
 
     if CAUSAL:
         lo = tl.maximum(n_start - k_start - P_SEQ, 0)
@@ -414,11 +423,10 @@ def _bwd_kv_dise_kernel_varlen(
         if HAS_C2P or HAS_P2C:
             slot = tl.load(POS_LUT + distance, mask=valid, other=0)
         if HAS_C2P:
-            s += tl.load(K_POS + offs_m_abs[:, None] * stride_pk0 + off_h * stride_pk1 + slot * stride_pk2,
+            s += tl.load(K_POS + offs_m_abs.to(tl.int64)[:, None] * stride_pk0 + slot * stride_pk2,
                          mask=valid, other=0.0).to(tl.float32)
         if HAS_P2C:
-            s += tl.load(Q_POS + offs_n_abs[None, :] * stride_pq0 + off_h * stride_pq1 + slot * stride_pq2,
-                         mask=valid, other=0.0).to(tl.float32)
+            s += tl.load(q_pos_rows[None, :] + slot * stride_pq2, mask=valid, other=0.0).to(tl.float32)
 
         p = tl.math.exp2(s * qk_scale - l[:, None] * log2e)
         p = tl.where(valid, p, 0.0)
@@ -434,7 +442,7 @@ def _bwd_kv_dise_kernel_varlen(
             # Each (key row, distance) cell has one writer: plain stores, no atomics.
             column = distance - BAND_LOW
             inside = valid & (column > 0) & (column < NUM_COLUMNS - 1)
-            tl.store(P2C_BAND + offs_n_abs[None, :] * NUM_COLUMNS + column, ds.to(input_dtype), mask=inside)
+            tl.store(band_rows[None, :] + column, ds.to(input_dtype), mask=inside)
             low_sum += tl.sum(tl.where(column <= 0, ds, 0.0), axis=0)
             high_sum += tl.sum(tl.where(column >= NUM_COLUMNS - 1, ds, 0.0), axis=0)
 
@@ -443,7 +451,6 @@ def _bwd_kv_dise_kernel_varlen(
     tl.store(DV + offs_n_abs[:, None] * stride_dvz + off_h * stride_dvh + offs_k[None, :] * stride_dvk,
              dv.to(input_dtype), mask=mask_n[:, None])
     if HAS_P2C:
-        band_rows = P2C_BAND + offs_n_abs * NUM_COLUMNS
         tl.store(band_rows, low_sum.to(input_dtype), mask=mask_n)
         tl.store(band_rows + NUM_COLUMNS - 1, high_sum.to(input_dtype), mask=mask_n)
 
@@ -506,8 +513,12 @@ def _bwd_q_dise_kernel_varlen(
     # C2P gradients of distances saturated into the first/last slot, per query row.
     low_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
     high_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+    # Packed position scores and bands span all tokens: keep their offsets in int64.
     if HAS_C2P:
-        C2P_BAND += off_h.to(tl.int64) * stride_band_h
+        k_pos_rows = K_POS + off_h.to(tl.int64) * stride_pk1 + offs_m_abs.to(tl.int64) * stride_pk0
+        band_rows = C2P_BAND + off_h.to(tl.int64) * stride_band_h + offs_m_abs.to(tl.int64) * NUM_COLUMNS
+    if HAS_P2C:
+        Q_POS += off_h.to(tl.int64) * stride_pq1
 
     k_ptrs = K + ((k_start + offs_n_base)[:, None] * stride_kz + off_h * stride_kh + offs_k[None, :] * stride_kk)
     v_ptrs = V + ((k_start + offs_n_base)[:, None] * stride_vz + off_h * stride_vh + offs_k[None, :] * stride_vk)
@@ -529,10 +540,9 @@ def _bwd_q_dise_kernel_varlen(
         if HAS_C2P or HAS_P2C:
             slot = tl.load(POS_LUT + distance, mask=valid, other=0)
         if HAS_C2P:
-            s += tl.load(K_POS + offs_m_abs[:, None] * stride_pk0 + off_h * stride_pk1 + slot * stride_pk2,
-                         mask=valid, other=0.0).to(tl.float32)
+            s += tl.load(k_pos_rows[:, None] + slot * stride_pk2, mask=valid, other=0.0).to(tl.float32)
         if HAS_P2C:
-            s += tl.load(Q_POS + (k_start + offs_n_rel)[None, :] * stride_pq0 + off_h * stride_pq1 + slot * stride_pq2,
+            s += tl.load(Q_POS + (k_start + offs_n_rel).to(tl.int64)[None, :] * stride_pq0 + slot * stride_pq2,
                          mask=valid, other=0.0).to(tl.float32)
 
         p = tl.math.exp2(s * qk_scale - l[:, None] * log2e)
@@ -548,7 +558,7 @@ def _bwd_q_dise_kernel_varlen(
             # Columns run in reverse distance order so stores ascend along the key axis.
             column = NUM_COLUMNS - 1 - (distance - BAND_LOW)
             inside = valid & (column > 0) & (column < NUM_COLUMNS - 1)
-            tl.store(C2P_BAND + offs_m_abs[:, None] * NUM_COLUMNS + column, ds.to(input_dtype), mask=inside)
+            tl.store(band_rows[:, None] + column, ds.to(input_dtype), mask=inside)
             high_sum += tl.sum(tl.where(column <= 0, ds, 0.0), axis=1)
             low_sum += tl.sum(tl.where(column >= NUM_COLUMNS - 1, ds, 0.0), axis=1)
 
@@ -558,7 +568,6 @@ def _bwd_q_dise_kernel_varlen(
     tl.store(DQ + offs_m_abs[:, None] * stride_dqz + off_h * stride_dqh + offs_k[None, :] * stride_dqk,
              dq.to(input_dtype), mask=mask_m[:, None])
     if HAS_C2P:
-        band_rows = C2P_BAND + offs_m_abs * NUM_COLUMNS
         tl.store(band_rows, high_sum.to(input_dtype), mask=mask_m)
         tl.store(band_rows + NUM_COLUMNS - 1, low_sum.to(input_dtype), mask=mask_m)
 
