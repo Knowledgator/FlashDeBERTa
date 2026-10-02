@@ -47,36 +47,39 @@ model = FlashDebertaV2Model.from_pretrained("microsoft/deberta-v3-base", _attn_i
 
 ### Kernel Tuning ⚙️
 
-FlashDeBERTa automatically selects optimal kernel parameters based on your GPU. For advanced users who want to fine-tune performance, you can override these defaults using environment variables:
+FlashDeBERTa ships kernel parameters measured on an RTX 5060 Ti (BF16, head dim 64): the kernels are bound by position-score gathers, so small tiles with a single pipeline stage are fastest. If a configuration does not fit your GPU's shared memory, it is shrunk automatically at launch. You can override the defaults with environment variables:
 
 ```bash
-# Configure forward pass
-export FLASHDEBERTA_FWD_BLOCK_M=128
+# Configure forward pass (defaults: 64, 64, 1, 4)
+export FLASHDEBERTA_FWD_BLOCK_M=64
 export FLASHDEBERTA_FWD_BLOCK_N=64
-export FLASHDEBERTA_FWD_NUM_STAGES=3
+export FLASHDEBERTA_FWD_NUM_STAGES=1
 export FLASHDEBERTA_FWD_NUM_WARPS=4
 
-# Configure backward pass (optional)
+# Configure both backward kernels (optional)
 export FLASHDEBERTA_BWD_BLOCK_M=64
-export FLASHDEBERTA_BWD_BLOCK_N=64
-export FLASHDEBERTA_BWD_NUM_STAGES=2
+export FLASHDEBERTA_BWD_BLOCK_N=32
+export FLASHDEBERTA_BWD_NUM_STAGES=1
 export FLASHDEBERTA_BWD_NUM_WARPS=4
+
+# Or one backward kernel: FLASHDEBERTA_BWD_KV_* (dK/dV, default 64, 32, 1, 4)
+# and FLASHDEBERTA_BWD_Q_* (dQ, default 16, 64, 1, 4)
 
 python train.py
 ```
 
-Or set them directly in Python before importing:
+Or set them directly in Python before the first forward pass:
 ```python
 import os
-os.environ['FLASHDEBERTA_FWD_BLOCK_M'] = '128'
+os.environ['FLASHDEBERTA_FWD_BLOCK_M'] = '64'
 os.environ['FLASHDEBERTA_FWD_BLOCK_N'] = '64'
-os.environ['FLASHDEBERTA_FWD_NUM_STAGES'] = '3'
+os.environ['FLASHDEBERTA_FWD_NUM_STAGES'] = '1'
 os.environ['FLASHDEBERTA_FWD_NUM_WARPS'] = '4'
 
 from flashdeberta import FlashDebertaV2Model
 ```
 
-**Note:** All four parameters must be set together to take effect. Typical values: BLOCK_M/N ∈ {32, 64, 128}, num_stages ∈ {1, 2, 3, 4}, num_warps ∈ {4, 8}.
+**Note:** All four parameters of a group must be set together to take effect. Typical values: BLOCK_M/N ∈ {16, 32, 64, 128}, num_stages ∈ {1, 2, 3}, num_warps ∈ {4, 8}.
 
 ### Benchmarks
 
@@ -86,7 +89,6 @@ While context-to-position and position-to-context biases still require quadratic
 
 ### Future Work
 
-- Implement backward kernels.
 - Train DeBERTa models on 8,192-token sequences using high-quality data.
 - Integrate FlashDeBERTa into GLiNER and GLiClass.
 - Train multi-modal DeBERTa models.

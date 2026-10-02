@@ -326,7 +326,7 @@ def compare_flash_and_deberta_backward(
 # Example
 if __name__ == "__main__":
     _ = compare_flash_and_deberta_backward(
-        B=4, L=1024, hidden_size=768,
+        B=2, L=2048, hidden_size=768,
         pos_att_type=["p2c", "c2p"],
         varlen=True, verbose=True, print_top_k=30
     )
