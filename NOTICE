@@ -1,0 +1,26 @@
+FlashDeBERTa
+Copyright 2024-2026 Knowledgator
+
+This product is licensed under the Apache License, Version 2.0, and includes
+software adapted from the following Apache-2.0 licensed projects.
+
+FlagAttention (https://github.com/FlagOpen/FlagAttention)
+Copyright 2023 BAAI
+  The FlashAttention-style Triton kernel structure in
+  src/flashdeberta/ops/flash_attention.py,
+  src/flashdeberta/ops/flash_attention_varlen.py and
+  src/flashdeberta/ops/flash_attention_bias.py is derived from FlagAttention.
+
+DisentangledFlash (https://github.com/delyan-boychev/disentangled-flash)
+Copyright 2026 Delyan Boychev
+  Relative-position lookup planning and banded positional-gradient
+  accumulation adapted from DisentangledFlash, commits
+  f185d9a6ae1cce42a54573208dba27fae828be98 and
+  892cdc27c98a3d21019c58e85b7e7ceae2318d5e. Affected files:
+  src/flashdeberta/ops/position.py,
+  src/flashdeberta/ops/flash_attention.py and
+  src/flashdeberta/ops/flash_attention_varlen.py.
+  Modified by Knowledgator for FlashDeBERTa's tensor layouts and kernels.
+
+The flash_attention_bias.py kernel additionally carries a CATIE copyright
+notice (Copyright 2024 CATIE), retained in that file.

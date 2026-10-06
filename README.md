@@ -10,9 +10,6 @@ DeBERTa remains one of the top-performing models for the following tasks:
 - **Text Classification:** DeBERTa is highly effective for supervised and zero-shot classification tasks, such as [GLiClass](https://github.com/Knowledgator/GLiClass).
 - **Reranking:** The model offers competitive performance compared to other reranking models, making it a valuable component in many RAG systems.
 
-> [!warning]
-> This project is under active development and may contain bugs. Please create an issue if you encounter bugs or have suggestions for improvements.
-
 ### Installation
 
 First, install the package:
@@ -89,6 +86,13 @@ While context-to-position and position-to-context biases still require quadratic
 
 Below, you can find a breakdown of inference and training speed gains together with growing memory efficiency for the [DeBERTa-based model](https://huggingface.co/knowledgator/gliclass-small-v1.0) evaluated during inference and training on different batch sizes and sequence lengths.
 ![gliclass_benchmarking](images/flash_attention_benchmark.png)
+
+### Acknowledgements
+
+- The Triton kernel structure is derived from [FlagAttention](https://github.com/FlagOpen/FlagAttention) (BAAI, Apache 2.0).
+- Relative-position lookup planning and banded positional-gradient accumulation adapted from [DisentangledFlash](https://github.com/delyan-boychev/disentangled-flash) by Delyan Boychev (Apache 2.0), commits [f185d9a](https://github.com/delyan-boychev/disentangled-flash/commit/f185d9a6ae1cce42a54573208dba27fae828be98) and [892cdc2](https://github.com/delyan-boychev/disentangled-flash/commit/892cdc27c98a3d21019c58e85b7e7ceae2318d5e).
+
+See [NOTICE](NOTICE) for details.
 
 ### Future Work
 

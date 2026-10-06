@@ -1,10 +1,11 @@
 [tool.poetry]
 name = "flashDeBERTa"
-version = "0.0.7"
+version = "0.0.8"
 description = "Memory and compute efficient DeBERTa models."
 authors = ["knowledgator.com"]
 license = "Apache-2.0"
 readme = "README.md"
+include = [{ path = "NOTICE", format = ["sdist", "wheel"] }]
 
 [tool.poetry.dependencies]
 python = "^3.10"
