@@ -29,7 +29,7 @@ import triton.language as tl
 from .config import forward_config, backward_configs
 from .launch import launch, clear_launch_cache
 from .position import (position_plan, position_table, fold_matrix, fold_band_gradients,
-                       clear_position_cache)
+                       clear_position_cache, prepare_positions)
 
 def cdiv(a, b):
     return (a + b - 1) // b
@@ -37,7 +37,7 @@ def cdiv(a, b):
 @triton.jit
 def _fwd_kernel_deberta_disentangled_attention(
     Q, K, V,
-    K_POS, Q_POS, POS_LUT,
+    K_POS, Q_POS, POS_LUT, POSITIONS,
     L, O,
     SEQ_LENGTHS,
     sm_scale,
@@ -47,10 +47,10 @@ def _fwd_kernel_deberta_disentangled_attention(
     stride_oz, stride_oh, stride_om, stride_ok,
     stride_pk0, stride_pk1, stride_pk2, stride_pk3,
     stride_pq0, stride_pq1, stride_pq2, stride_pq3,
-    Z, H, M, N, P_SEQ,
+    Z, H, M, N, P_SEQ, PLAN_N, stride_posz,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, LARGER_M: tl.constexpr,
-    HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr,
+    HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr, HAS_POSITIONS: tl.constexpr,
 ):
     input_dtype = Q.dtype.element_ty
 
@@ -82,6 +82,11 @@ def _fwd_kernel_deberta_disentangled_attention(
 
     seq_length = tl.load(SEQ_LENGTHS + off_z).to(tl.int32)
     mask_m = offs_m < seq_length
+    if HAS_POSITIONS:
+        POSITIONS += off_z.to(tl.int64) * stride_posz
+        pos_m = tl.load(POSITIONS + offs_m, mask=mask_m, other=0)
+    else:
+        pos_m = offs_m
 
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0, cache_modifier=".cg")
 
@@ -112,7 +117,11 @@ def _fwd_kernel_deberta_disentangled_attention(
 
         if HAS_C2P or HAS_P2C:
             # Slot of every (query, key) pair from the distance lookup table.
-            slot = tl.load(POS_LUT + (offs_m[:, None] - offs_n[None, :] + N - 1), mask=valid, other=0)
+            if HAS_POSITIONS:
+                pos_n = tl.load(POSITIONS + offs_n, mask=mask_n, other=0)
+            else:
+                pos_n = offs_n
+            slot = tl.load(POS_LUT + (pos_m[:, None] - pos_n[None, :] + PLAN_N - 1), mask=valid, other=0)
         if HAS_C2P:
             s += tl.load(K_POS + offs_m[:, None] * stride_pk2 + slot * stride_pk3,
                          mask=valid, other=0.0).to(tl.float32)
@@ -159,7 +168,7 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
 
 
 def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, causal, sm_scale,
-                           BLOCK_M, BLOCK_N, num_warps, num_stages):
+                           BLOCK_M, BLOCK_N, num_warps, num_stages, positions=None, plan_n=None):
     """
     Performs the forward pass of FlashAttention with DeBERTa-style disentangled relative attention.
 
@@ -172,6 +181,8 @@ def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, ca
         pos_key: C2P scores ``q @ pos_key_layer^T`` of shape (B, H, M, 2 * ATT_SPAN), or None
         pos_query: P2C scores ``k @ pos_query_layer^T`` of shape (B, H, N, 2 * ATT_SPAN), or None
         pos_lut: int32 slot of each distance ``i - j + N - 1`` (see ``ops.position``)
+        positions: optional int32 (B, M) position of every token; distances become
+                   ``positions[i] - positions[j] + plan_n - 1`` (``plan_n`` = span of the plan behind ``pos_lut``)
         causal: Whether to apply causal masking
         sm_scale: Softmax scale factor
         BLOCK_M, BLOCK_N: Block sizes for tiling
@@ -193,6 +204,9 @@ def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, ca
 
     has_c2p = pos_key is not None
     has_p2c = pos_query is not None
+    has_positions = positions is not None
+    if plan_n is None:
+        plan_n = N
 
     o = torch.zeros_like(q)
     L = torch.zeros((B, H, M), device=q.device, dtype=torch.float32)
@@ -202,7 +216,7 @@ def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, ca
 
     args = (
         q, k, v,
-        pos_key, pos_query, pos_lut,
+        pos_key, pos_query, pos_lut, positions,
         L, o,
         seq_lengths,
         sm_scale,
@@ -212,13 +226,14 @@ def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, ca
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         *stride_pk,
         *stride_pq,
-        B, H, M, N, P_SEQ,
+        B, H, M, N, P_SEQ, plan_n, positions.stride(0) if has_positions else 0,
     )
-    kwargs = dict(BLOCK_DMODEL=D, IS_CAUSAL=causal, LARGER_M=M > N, HAS_C2P=has_c2p, HAS_P2C=has_p2c)
+    kwargs = dict(BLOCK_DMODEL=D, IS_CAUSAL=causal, LARGER_M=M > N, HAS_C2P=has_c2p, HAS_P2C=has_p2c,
+                  HAS_POSITIONS=has_positions)
     with torch.cuda.device(q.device.index):
         launch(
             _fwd_kernel_deberta_disentangled_attention,
-            ("fwd", D, q.dtype, causal, has_c2p, has_p2c),
+            ("fwd", D, q.dtype, causal, has_c2p, has_p2c, has_positions),
             (BLOCK_M, BLOCK_N, num_stages, num_warps),
             lambda block_m, block_n: ((cdiv(M, block_m), H, B), args, kwargs),
         )
@@ -267,7 +282,7 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_kv_dise_kernel(
-    Q, K, V, SEQ_LENGTHS, K_POS, Q_POS, POS_LUT, sm_scale, DO,
+    Q, K, V, SEQ_LENGTHS, K_POS, Q_POS, POS_LUT, POSITIONS, sm_scale, DO,
     DK, DV, P2C_BAND,
     L, Delta,
     stride_qz, stride_qh, stride_qm, stride_qk,
@@ -279,10 +294,10 @@ def _bwd_kv_dise_kernel(
     stride_pk0, stride_pk1, stride_pk2, stride_pk3,
     stride_pq0, stride_pq1, stride_pq2, stride_pq3,
     stride_band_h, stride_band_z,
-    Z, H, M, N, P_SEQ, BAND_LOW, NUM_COLUMNS,
+    Z, H, M, N, P_SEQ, PLAN_N, stride_posz, BAND_LOW, NUM_COLUMNS,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
-    HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr,
+    HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr, HAS_POSITIONS: tl.constexpr,
 ):
     input_dtype = Q.dtype.element_ty
     log2e: tl.constexpr = 1.4426950408889634
@@ -322,6 +337,11 @@ def _bwd_kv_dise_kernel(
     offs_k      = tl.arange(0, BLOCK_DMODEL)
 
     mask_n = offs_n < seq_length
+    if HAS_POSITIONS:
+        POSITIONS += off_z.to(tl.int64) * stride_posz
+        pos_n = tl.load(POSITIONS + offs_n, mask=mask_n, other=0)
+    else:
+        pos_n = offs_n
     k = tl.load(K + offs_n[:, None]*stride_kn + offs_k[None, :]*stride_kk, mask=mask_n[:, None], other=0.0)
     v = tl.load(V + offs_n[:, None]*stride_vn + offs_k[None, :]*stride_vk, mask=mask_n[:, None], other=0.0)
 
@@ -334,6 +354,10 @@ def _bwd_kv_dise_kernel(
     for start_m in range(lo, m_limit, BLOCK_M):
         offs_m = start_m + offs_m_base
         mask_m = offs_m < seq_length
+        if HAS_POSITIONS:
+            pos_m = tl.load(POSITIONS + offs_m, mask=mask_m, other=0)
+        else:
+            pos_m = offs_m
         valid = mask_m[:, None] & mask_n[None, :]
         if CAUSAL:
             valid = valid & ((P_SEQ + offs_m[:, None]) >= offs_n[None, :])
@@ -345,7 +369,7 @@ def _bwd_kv_dise_kernel(
 
         s = tl.dot(q, tl.trans(k))
 
-        distance = offs_m[:, None] - offs_n[None, :] + N - 1
+        distance = pos_m[:, None] - pos_n[None, :] + PLAN_N - 1
         if HAS_C2P or HAS_P2C:
             slot = tl.load(POS_LUT + distance, mask=valid, other=0)
         if HAS_C2P:
@@ -383,7 +407,7 @@ def _bwd_kv_dise_kernel(
 
 @triton.jit
 def _bwd_q_dise_kernel(
-    Q, K, V, SEQ_LENGTHS, K_POS, Q_POS, POS_LUT, sm_scale, DO,
+    Q, K, V, SEQ_LENGTHS, K_POS, Q_POS, POS_LUT, POSITIONS, sm_scale, DO,
     DQ, C2P_BAND,
     L, Delta,
     stride_qz, stride_qh, stride_qm, stride_qk,
@@ -394,9 +418,9 @@ def _bwd_q_dise_kernel(
     stride_pk0, stride_pk1, stride_pk2, stride_pk3,
     stride_pq0, stride_pq1, stride_pq2, stride_pq3,
     stride_band_h, stride_band_z,
-    Z, H, M, N, P_SEQ, BAND_LOW, NUM_COLUMNS,
+    Z, H, M, N, P_SEQ, PLAN_N, stride_posz, BAND_LOW, NUM_COLUMNS,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
-    CAUSAL: tl.constexpr, HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr,
+    CAUSAL: tl.constexpr, HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr, HAS_POSITIONS: tl.constexpr,
 ):
     input_dtype = Q.dtype.element_ty
     log2e: tl.constexpr = 1.4426950408889634
@@ -427,6 +451,11 @@ def _bwd_q_dise_kernel(
 
     seq_length = tl.load(SEQ_LENGTHS + off_z).to(tl.int32)
     mask_m = offs_m < seq_length
+    if HAS_POSITIONS:
+        POSITIONS += off_z.to(tl.int64) * stride_posz
+        pos_m = tl.load(POSITIONS + offs_m, mask=mask_m, other=0)
+    else:
+        pos_m = offs_m
 
     q  = tl.load(Q + offs_m[:, None]*stride_qm + offs_k[None, :]*stride_qk, mask=mask_m[:, None], other=0.0)
     do = tl.load(DO + offs_m[:, None]*stride_dom + offs_k[None, :]*stride_dok, mask=mask_m[:, None], other=0.0)
@@ -452,6 +481,10 @@ def _bwd_q_dise_kernel(
         start_n = tl.multiple_of(start_n, BLOCK_N)
         offs_n = start_n + offs_n_base
         mask_n = offs_n < seq_length
+        if HAS_POSITIONS:
+            pos_n = tl.load(POSITIONS + offs_n, mask=mask_n, other=0)
+        else:
+            pos_n = offs_n
         valid = mask_m[:, None] & mask_n[None, :]
         if CAUSAL:
             valid = valid & ((P_SEQ + offs_m[:, None]) >= offs_n[None, :])
@@ -461,7 +494,7 @@ def _bwd_q_dise_kernel(
 
         s = tl.dot(q, tl.trans(k))
 
-        distance = offs_m[:, None] - offs_n[None, :] + N - 1
+        distance = pos_m[:, None] - pos_n[None, :] + PLAN_N - 1
         if HAS_C2P or HAS_P2C:
             slot = tl.load(POS_LUT + distance, mask=valid, other=0)
         if HAS_C2P:
@@ -499,7 +532,7 @@ def _bwd_q_dise_kernel(
 
 
 def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal, sm_scale,
-                           pos_lut, band_low, num_columns, kv_config, q_config):
+                           pos_lut, band_low, num_columns, kv_config, q_config, positions=None, plan_n=None):
     """
     Performs the backward pass of FlashAttention with DeBERTa-style disentangled relative attention.
 
@@ -530,6 +563,10 @@ def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal,
 
     has_c2p = k_pos is not None
     has_p2c = q_pos is not None
+    has_positions = positions is not None
+    if plan_n is None:
+        plan_n = N
+    stride_posz = positions.stride(0) if has_positions else 0
 
     delta = torch.zeros_like(L)
     BLOCK_M = 64
@@ -558,7 +595,7 @@ def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal,
     stride_p2c_band = p2c_band.stride()[:2] if has_p2c else (0, 0)
 
     kv_args = (
-        q, k, v, seq_lengths, k_pos, q_pos, pos_lut, sm_scale, do,
+        q, k, v, seq_lengths, k_pos, q_pos, pos_lut, positions, sm_scale, do,
         dk, dv, p2c_band,
         L, delta,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -570,10 +607,10 @@ def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal,
         *stride_pk,
         *stride_pq,
         *stride_p2c_band,
-        B, H, M, N, P_SEQ, band_low, num_columns,
+        B, H, M, N, P_SEQ, plan_n, stride_posz, band_low, num_columns,
     )
     q_args = (
-        q, k, v, seq_lengths, k_pos, q_pos, pos_lut, sm_scale, do,
+        q, k, v, seq_lengths, k_pos, q_pos, pos_lut, positions, sm_scale, do,
         dq, c2p_band,
         L, delta,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -584,10 +621,10 @@ def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal,
         *stride_pk,
         *stride_pq,
         *stride_c2p_band,
-        B, H, M, N, P_SEQ, band_low, num_columns,
+        B, H, M, N, P_SEQ, plan_n, stride_posz, band_low, num_columns,
     )
-    kwargs = dict(BLOCK_DMODEL=D, CAUSAL=causal, HAS_C2P=has_c2p, HAS_P2C=has_p2c)
-    key = (D, q.dtype, causal, has_c2p, has_p2c)
+    kwargs = dict(BLOCK_DMODEL=D, CAUSAL=causal, HAS_C2P=has_c2p, HAS_P2C=has_p2c, HAS_POSITIONS=has_positions)
+    key = (D, q.dtype, causal, has_c2p, has_p2c, has_positions)
     with torch.cuda.device(q.device.index):
         launch(_bwd_kv_dise_kernel, ("bwd_kv",) + key, kv_config,
                lambda block_m, block_n: ((cdiv(N, block_n), H, B), kv_args, kwargs))
@@ -612,7 +649,7 @@ def _head_rows(layer):
 class FlashAttentionDisentangled(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal,
-                sm_scale, position_buckets, max_relative_distance):
+                sm_scale, position_buckets, max_relative_distance, positions=None, position_span=None):
 
         Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Dq == Dk == Dv, "Query, key, and value must have the same head dimension"
@@ -623,7 +660,10 @@ class FlashAttentionDisentangled(torch.autograd.Function):
             sm_scale = 1. / math.sqrt(D)
 
         ATT_SPAN = position_buckets if position_buckets > 0 else max_relative_distance
-        plan = position_plan(M, N, position_buckets, max_relative_distance, ATT_SPAN, q.device)
+        # Custom positions: the plan covers every distance between two positions below ``plan_len``.
+        positions, plan_len = prepare_positions(positions, position_span, (B, M), N)
+        plan_m, plan_n = (M, N) if positions is None else (plan_len, plan_len)
+        plan = position_plan(plan_m, plan_n, position_buckets, max_relative_distance, ATT_SPAN, q.device)
 
         # C2P/P2C scores are plain GEMMs; the kernel gathers them per (query, key) pair.
         pos_key = pos_query = None
@@ -638,7 +678,7 @@ class FlashAttentionDisentangled(torch.autograd.Function):
 
         o, L = flash_attn_v2_fwd_dise(
             q, k, v, seq_lengths, pos_key, pos_query, plan.lut, causal, sm_scale,
-            BLOCK_M, BLOCK_N, num_warps, num_stages,
+            BLOCK_M, BLOCK_N, num_warps, num_stages, positions, plan_n,
         )
 
         # Position scores are recomputed in backward instead of being kept alive.
@@ -649,6 +689,8 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         ctx.position_buckets = position_buckets
         ctx.max_relative_distance = max_relative_distance
         ctx.ATT_SPAN = ATT_SPAN
+        ctx.positions = positions
+        ctx.plan_shape = (plan_m, plan_n)
         return o
 
     @staticmethod
@@ -658,7 +700,8 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         ATT_SPAN = ctx.ATT_SPAN
         B, H, M, D = q.shape
         N = k.shape[2]
-        plan = position_plan(M, N, ctx.position_buckets, ctx.max_relative_distance, ATT_SPAN, q.device)
+        plan_m, plan_n = ctx.plan_shape
+        plan = position_plan(plan_m, plan_n, ctx.position_buckets, ctx.max_relative_distance, ATT_SPAN, q.device)
 
         pos_key = pos_query = None
         if pos_key_layer is not None:
@@ -678,12 +721,12 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         do = do.contiguous() if do.stride(-1) != 1 else do
         dq, dk, dv, c2p_band, p2c_band = flash_attn_v2_bwd_dise(
             o, do, q, k, v, ctx.seq_lengths, pos_key, pos_query, L, causal, ctx.sm_scale,
-            plan.lut, plan.band_low, plan.num_columns, kv_config, q_config,
+            plan.lut, plan.band_low, plan.num_columns, kv_config, q_config, ctx.positions, plan_n,
         )
 
         d_pos_key_layer = d_pos_query_layer = None
         if c2p_band is not None or p2c_band is not None:
-            fold = fold_matrix(M, N, ctx.position_buckets, ctx.max_relative_distance, ATT_SPAN, q.device, q.dtype)
+            fold = fold_matrix(plan_m, plan_n, ctx.position_buckets, ctx.max_relative_distance, ATT_SPAN, q.device, q.dtype)
         if c2p_band is not None:
             grad_rows, grad_table = fold_band_gradients(
                 c2p_band.view(H, B * M, -1), _head_rows(q), key_table, fold.flip(0))
@@ -695,11 +738,12 @@ class FlashAttentionDisentangled(torch.autograd.Function):
             dk = dk + grad_rows.view(H, B, N, D).permute(1, 0, 2, 3)
             d_pos_query_layer = grad_table.view(pos_query_layer.shape)
 
-        return dq, dk, dv, None, d_pos_key_layer, d_pos_query_layer, None, None, None, None
+        return dq, dk, dv, None, d_pos_key_layer, d_pos_query_layer, None, None, None, None, None, None
 
 
 def flash_attention_with_disentangled(q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal=False,
-                                      sm_scale=None, position_buckets=0, max_relative_distance=0):
+                                      sm_scale=None, position_buckets=0, max_relative_distance=0,
+                                      positions=None, position_span=None):
     """
     Exact DeBERTa disentangled attention.
 
@@ -708,6 +752,11 @@ def flash_attention_with_disentangled(q, k, v, seq_lengths, pos_key_layer, pos_q
         seq_lengths: (B,) int32 valid lengths (right padding), or None
         pos_key_layer: (1, H, 2 * ATT_SPAN, D) projected relative embeddings for C2P, or None
         pos_query_layer: (1, H, 2 * ATT_SPAN, D) projected relative embeddings for P2C, or None
+        positions: optional (B, L) integer position of every token. The relative distance of a pair is
+            ``positions[i] - positions[j]`` instead of ``i - j``, e.g. ``row * stride + column`` for an image
+            grid. Positions must be unique inside a sequence and lie in ``[0, position_span)``.
+        position_span: exclusive upper bound of ``positions``; read from the tensor when omitted (one sync).
     """
     return FlashAttentionDisentangled.apply(q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal,
-                                            sm_scale, position_buckets, max_relative_distance)
+                                            sm_scale, position_buckets, max_relative_distance,
+                                            positions, position_span)
