@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 from flashdeberta.ops.flash_attention import flash_attention_with_disentangled
 from flashdeberta.ops.flash_attention_varlen import flash_attention_with_disentangled_varlen
-from flashdeberta.ops.position import make_log_bucket_position, position_plan
+from flashdeberta.ops.position import (make_log_bucket_position, position_plan, positions_are_unique,
+                                       prepare_positions)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -20,9 +21,15 @@ def slot_index(M, N, device):
     return torch.clamp(make_log_bucket_position(rel, SPAN, MAX_REL).long() + SPAN, 0, 2 * SPAN - 1)
 
 
-def reference(q, k, v, pos_key_layer, pos_query_layer, lengths, causal):
+def reference(q, k, v, pos_key_layer, pos_query_layer, lengths, causal, token_positions=None):
     B, _, L, _ = q.shape
-    idx = slot_index(L, L, q.device).expand(B, H, L, L)
+    if token_positions is None:
+        idx = slot_index(L, L, q.device).expand(B, H, L, L)
+    else:
+        # Relative distance of a pair is the difference of its tokens' positions.
+        rel = token_positions.long()[:, :, None] - token_positions.long()[:, None, :]
+        idx = torch.clamp(make_log_bucket_position(rel, SPAN, MAX_REL).long() + SPAN, 0, 2 * SPAN - 1)
+        idx = idx[:, None].expand(B, H, L, L)
     scores = q @ k.transpose(-1, -2)
     if pos_key_layer is not None:
         scores = scores + torch.gather(q @ pos_key_layer.transpose(-1, -2), -1, idx)
@@ -145,3 +152,138 @@ def test_position_table_size_is_checked():
     q, k, v, pk, pq = inputs
     with pytest.raises(ValueError, match="rows"):
         flash_attention_with_disentangled(q, k, v, None, pk[:, :, :SPAN], pq, False, SM_SCALE, SPAN, MAX_REL)
+
+
+# ── custom token positions ────────────────────────────────────────────────────
+
+def grid_positions(B, L, grid, stride):
+    """[CLS] [IMG] grid x grid patches [/IMG] text...: patches at ``row * stride + column``."""
+    rows, cols = torch.meshgrid(torch.arange(grid), torch.arange(grid), indexing="ij")
+    patches = 2 + (rows * stride + cols).flatten()
+    close = 2 + (grid - 1) * stride + grid
+    head = torch.cat([torch.tensor([0, 1]), patches, torch.tensor([close])])
+    assert L >= head.numel(), "sequence too short for the grid"
+    text = close + 1 + torch.arange(L - head.numel())
+    return torch.cat([head, text]).to("cuda", torch.int32).expand(B, L).contiguous()
+
+
+def make_positions(layout, B, L):
+    if layout == "arange":
+        return torch.arange(L, device="cuda", dtype=torch.int32).expand(B, L).contiguous()
+    if layout == "grid":
+        grid, stride = (16, 32) if L >= 300 else (4, 8)
+        return grid_positions(B, L, grid, stride)
+    if layout == "shuffled":  # unique positions in random order, spread over a span 3x the length
+        g = torch.Generator().manual_seed(L)
+        return torch.stack([torch.randperm(3 * L, generator=g)[:L] for _ in range(B)]).to("cuda", torch.int32)
+    raise ValueError(layout)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("B,L,padded", [(2, 64, False), (2, 100, True), (2, 512, False), (3, 700, True), (1, 2048, False)])
+@pytest.mark.parametrize("layout", ["arange", "grid", "shuffled"])
+def test_fixed_length_positions(dtype, B, L, padded, layout):
+    inputs, lengths, grad_out = make_inputs(B, L, dtype, padded)
+    token_positions = make_positions(layout, B, L)
+    assert positions_are_unique(token_positions, lengths)
+
+    def kernel(q, k, v, pk, pq):
+        return flash_attention_with_disentangled(q, k, v, lengths if padded else None, pk, pq,
+                                                 False, SM_SCALE, SPAN, MAX_REL, positions=token_positions)
+
+    def dense(q, k, v, pk, pq):
+        return reference(q, k, v, pk, pq, lengths, causal=False, token_positions=token_positions)
+
+    assert_close(run(kernel, inputs, grad_out), run(dense, inputs, grad_out, torch.float64), dtype)
+
+
+@pytest.mark.parametrize("terms", ["c2p", "p2c"])
+def test_fixed_length_positions_single_term(terms):
+    inputs, lengths, grad_out = make_inputs(2, 600, torch.bfloat16, padded=True)
+    q, k, v, pk, pq = inputs
+    inputs = (q, k, v, pk if terms == "c2p" else None, pq if terms == "p2c" else None)
+    token_positions = make_positions("grid", 2, 600)
+
+    def kernel(q, k, v, pk, pq):
+        return flash_attention_with_disentangled(q, k, v, lengths, pk, pq, False, SM_SCALE, SPAN, MAX_REL,
+                                                 positions=token_positions, position_span=1024)
+
+    def dense(q, k, v, pk, pq):
+        return reference(q, k, v, pk, pq, lengths, causal=False, token_positions=token_positions)
+
+    assert_close(run(kernel, inputs, grad_out), run(dense, inputs, grad_out, torch.float64), torch.bfloat16)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("B,L", [(3, 100), (4, 1024), (2, 2048)])
+@pytest.mark.parametrize("layout", ["arange", "grid", "shuffled"])
+def test_varlen_positions(dtype, B, L, layout):
+    inputs, _, grad_out = make_inputs(B, L, dtype, padded=False)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    lengths = torch.randint(L // 4, L + 1, (B,), device="cuda", dtype=torch.int32, generator=g)
+    lengths[0] = L
+    keep = torch.arange(L, device="cuda")[None, :] < lengths[:, None]
+    grad_out = grad_out * keep[:, None, :, None]
+    tokens = keep.flatten().nonzero().flatten()
+    cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+    token_positions = make_positions(layout, B, L)
+    packed_positions = token_positions.flatten()[tokens]
+
+    def kernel(q, k, v, pk, pq):
+        pack = lambda t: t.transpose(1, 2).reshape(B * L, H, D)[tokens]
+        out = flash_attention_with_disentangled_varlen(pack(q), pack(k), pack(v), pk, pq, cu_seqlens, cu_seqlens,
+                                                       L, L, False, SM_SCALE, SPAN, MAX_REL,
+                                                       positions=packed_positions)
+        full = torch.zeros(B * L, H, D, device="cuda", dtype=out.dtype).index_copy(0, tokens, out)
+        return full.view(B, L, H, D).transpose(1, 2)
+
+    def dense(q, k, v, pk, pq):
+        return reference(q, k, v, pk, pq, lengths, causal=False, token_positions=token_positions)
+
+    assert_close(run(kernel, inputs, grad_out), run(dense, inputs, grad_out, torch.float64), dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("B,L,padded", [(2, 100, True), (2, 700, False)])
+def test_sequential_positions_match_default_path(dtype, B, L, padded):
+    """positions = 0..L-1 is the default behavior: same output and gradients."""
+    inputs, lengths, grad_out = make_inputs(B, L, dtype, padded)
+    sequential = make_positions("arange", B, L)
+
+    def default(q, k, v, pk, pq):
+        return flash_attention_with_disentangled(q, k, v, lengths if padded else None, pk, pq,
+                                                 False, SM_SCALE, SPAN, MAX_REL)
+
+    def custom(q, k, v, pk, pq):
+        return flash_attention_with_disentangled(q, k, v, lengths if padded else None, pk, pq,
+                                                 False, SM_SCALE, SPAN, MAX_REL, positions=sequential)
+
+    for a, b in zip(run(custom, inputs, grad_out), run(default, inputs, grad_out)):
+        assert torch.allclose(a.float(), b.float(), rtol=2e-2 if dtype == torch.bfloat16 else 1e-4, atol=1e-3)
+
+
+def test_grid_positions_give_every_offset_its_own_slot():
+    """With stride 32 on a 16-wide grid, (dy, dx) -> 32 * dy + dx is unique, and exact while below SPAN / 2."""
+    dy, dx = torch.meshgrid(torch.arange(-15, 16), torch.arange(-15, 16), indexing="ij")
+    distance = (32 * dy + dx).flatten()
+    assert distance.unique().numel() == distance.numel()
+    exact = distance.abs() < SPAN // 2
+    slots = torch.clamp(make_log_bucket_position(distance, SPAN, MAX_REL).long() + SPAN, 0, 2 * SPAN - 1)
+    assert slots[exact].unique().numel() == int(exact.sum())
+    # Offsets of up to 3 rows in any direction are exact.
+    assert bool(exact[(dy.flatten().abs() <= 3)].all())
+
+
+def test_positions_are_validated():
+    inputs, _, _ = make_inputs(2, 64, torch.float32, padded=False)
+    q, k, v, pk, pq = inputs
+    with pytest.raises(ValueError, match="shape"):
+        flash_attention_with_disentangled(q, k, v, None, pk, pq, False, SM_SCALE, SPAN, MAX_REL,
+                                          positions=make_positions("arange", 2, 32))
+    with pytest.raises(ValueError, match="integer"):
+        prepare_positions(torch.zeros(2, 64, device="cuda"), None, (2, 64), 64)
+    duplicated = make_positions("arange", 2, 64).clone()
+    duplicated[0, 5] = duplicated[0, 4]
+    assert not positions_are_unique(duplicated)
+    # A duplicate that sits in the padding does not count.
+    assert positions_are_unique(duplicated, torch.tensor([4, 64], device="cuda"))

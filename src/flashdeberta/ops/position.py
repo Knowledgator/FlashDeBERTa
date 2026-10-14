@@ -133,6 +133,38 @@ def fold_band_gradients(band, rows, table, fold):
     return grad_rows, grad_table
 
 
+def prepare_positions(positions, position_span, shape, num_keys):
+    """Validate custom token positions and return ``(int32 positions, span)``, or ``(None, None)``.
+
+    ``positions[i] - positions[j]`` replaces ``i - j`` as the relative distance of a pair, so a
+    layout such as ``row * stride + column`` gives image patches 2-D relative positions. The
+    backward writes one gradient cell per (row, distance): positions must be unique inside a
+    sequence (see ``positions_are_unique``) and lie in ``[0, span)``.
+    """
+    if positions is None:
+        return None, None
+    if tuple(positions.shape) != tuple(shape):
+        raise ValueError(f"positions must have shape {tuple(shape)}, got {tuple(positions.shape)}")
+    if shape[-1] != num_keys:
+        raise ValueError("positions require the same number of queries and keys (self-attention)")
+    if positions.is_floating_point():
+        raise ValueError("positions must be an integer tensor")
+    span = int(positions.max()) + 1 if position_span is None else int(position_span)
+    return positions.to(torch.int32).contiguous(), span
+
+
+def positions_are_unique(positions, lengths=None):
+    """True if no two valid tokens of a padded (B, L) batch share a position."""
+    positions = positions.long()
+    if lengths is not None:
+        keep = torch.arange(positions.shape[1], device=positions.device)[None, :] < lengths[:, None]
+        # Padding gets distinct negative values so it never collides.
+        filler = -1 - torch.arange(positions.shape[1], device=positions.device)[None, :]
+        positions = torch.where(keep, positions, filler)
+    ordered = positions.sort(dim=1).values
+    return bool((ordered[:, 1:] != ordered[:, :-1]).all())
+
+
 def clear_position_cache():
     _position_plan.cache_clear()
     _fold_matrix.cache_clear()
