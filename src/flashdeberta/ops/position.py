@@ -119,6 +119,26 @@ def position_table(table, num_heads, att_span):
     return table
 
 
+def position_tables(table, index, num_heads, att_span, num_sequences):
+    """Validate (S, H, 2 * att_span, D) tables and the (B,) table index of every sequence.
+
+    Lets sequences of one batch use different position tables, e.g. relative embeddings projected
+    by a different LoRA adapter per sequence. Inference only: the attention backward rejects them.
+    """
+    if table.dim() != 4:
+        raise ValueError("per-sequence position tables must have shape (S, H, R, D)")
+    position_table(table[:1], num_heads, att_span)  # validates heads and rows
+    if index.dim() != 1 or index.shape[0] != num_sequences:
+        raise ValueError(f"position table index must have shape ({num_sequences},), got {tuple(index.shape)}")
+    return table
+
+
+def per_sequence_tables(table, index, num_heads, att_span, num_sequences):
+    """(S, H, 2 * att_span, D) tables and (B,) index -> (B, H, 2 * att_span, D), one table per sequence."""
+    position_tables(table, index, num_heads, att_span, num_sequences)
+    return table.index_select(0, index.to(device=table.device, dtype=torch.long))
+
+
 def fold_band_gradients(band, rows, table, fold):
     """Gradients of ``scores = rows @ table^T`` from band-column score gradients.
 

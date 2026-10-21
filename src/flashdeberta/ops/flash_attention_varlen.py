@@ -29,7 +29,7 @@ from typing import Tuple
 
 from .config import forward_config, backward_configs
 from .launch import launch, clear_launch_cache
-from .position import (position_plan, position_table, fold_matrix, fold_band_gradients, prepare_positions,
+from .position import (position_plan, position_table, position_tables, per_sequence_tables, fold_matrix, fold_band_gradients, prepare_positions,
                        clear_position_cache)
 
 def cdiv(a, b):
@@ -671,12 +671,84 @@ def _position_scores(rows, table):
     return torch.bmm(rows.transpose(0, 1), table.transpose(1, 2)).transpose(0, 1)
 
 
+@triton.jit
+def _segment_position_scores_kernel(
+    rows_ptr, tables_ptr, index_ptr, cu_seqlens_ptr, out_ptr,
+    H, R,
+    stride_rt, stride_rh, stride_rd,
+    stride_ts, stride_th, stride_tr, stride_td,
+    stride_ot, stride_oh, stride_or,
+    D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_R: tl.constexpr, IEEE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    pid_r = tl.program_id(2)
+    seq = pid_bh // H
+    head = pid_bh - seq * H
+
+    start = tl.load(cu_seqlens_ptr + seq).to(tl.int64)
+    length = tl.load(cu_seqlens_ptr + seq + 1).to(tl.int64) - start
+    if pid_m * BLOCK_M >= length:
+        return
+    table = tl.load(index_ptr + seq).to(tl.int64)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    offs_d = tl.arange(0, D)
+    m_mask = offs_m < length
+    r_mask = offs_r < R
+
+    rows = tl.load(rows_ptr + (start + offs_m)[:, None] * stride_rt + head * stride_rh + offs_d[None, :] * stride_rd,
+                   mask=m_mask[:, None], other=0.0)
+    tab = tl.load(tables_ptr + table * stride_ts + head * stride_th
+                  + offs_r[:, None] * stride_tr + offs_d[None, :] * stride_td,
+                  mask=r_mask[:, None], other=0.0)
+    if IEEE:
+        acc = tl.dot(rows, tl.trans(tab), input_precision="ieee")
+    else:
+        acc = tl.dot(rows, tl.trans(tab))
+    tl.store(out_ptr + (start + offs_m)[:, None] * stride_ot + head * stride_oh + offs_r[None, :] * stride_or,
+             acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & r_mask[None, :])
+
+
+def _position_scores_per_sequence(rows, tables, index, cu_seqlens, max_seqlen):
+    """(T, H, D) packed rows, (S, H, R, D) tables, (B,) table per sequence -> (T, H, R) scores.
+
+    A segmented GEMM: the rows of sequence b are multiplied by tables[index[b]] only, so the cost
+    matches the shared-table GEMM. Same head-major storage as `_position_scores`.
+    """
+    T, H, D = rows.shape
+    S, Ht, R, Dt = tables.shape
+    assert (Ht, Dt) == (H, D)
+    B = cu_seqlens.shape[0] - 1
+    out = torch.empty(H, T, R, device=rows.device, dtype=rows.dtype).transpose(0, 1)
+    if T == 0 or B == 0:
+        return out
+    if D < 16 or D & (D - 1):  # tl.dot needs a power-of-two head dim >= 16
+        token = torch.arange(T, device=rows.device)
+        seq = torch.searchsorted(cu_seqlens[1:].to(torch.long), token, right=True)
+        per_token = tables.index_select(0, index.to(torch.long))[seq]  # (T, H, R, D)
+        out.copy_(torch.einsum("thd,thrd->thr", rows, per_token))
+        return out
+    BLOCK_M, BLOCK_R = 64, 64
+    grid = (triton.cdiv(max_seqlen, BLOCK_M), B * H, triton.cdiv(R, BLOCK_R))
+    with torch.cuda.device(rows.device.index):
+        _segment_position_scores_kernel[grid](
+            rows, tables, index, cu_seqlens, out,
+            H, R,
+            *rows.stride(), *tables.stride(), *out.stride(),
+            D=D, BLOCK_M=BLOCK_M, BLOCK_R=BLOCK_R, IEEE=rows.dtype == torch.float32,
+        )
+    return out
+
+
 class FlashAttentionDisentangledVarlen(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, pos_key_layer, pos_query_layer,
                 cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k,
-                causal, sm_scale, position_buckets, max_relative_distance, positions=None, position_span=None):
+                causal, sm_scale, position_buckets, max_relative_distance, positions=None, position_span=None,
+                pos_key_index=None, pos_query_index=None):
 
         BM, H, D = q.shape
         assert (k.shape[1], v.shape[1]) == (H, H) and (k.shape[2], v.shape[2]) == (D, D)
@@ -692,11 +764,17 @@ class FlashAttentionDisentangledVarlen(torch.autograd.Function):
         plan = position_plan(plan_m, plan_n, position_buckets, max_relative_distance, ATT_SPAN, q.device)
 
         # C2P/P2C scores are plain GEMMs; the kernel gathers them per (query, key) pair.
+        def scores(rows, layer, index, cu_seqlens, max_seqlen):
+            if index is None:
+                return _position_scores(rows, position_table(layer, H, ATT_SPAN))
+            tables = position_tables(layer, index, H, ATT_SPAN, cu_seqlens.shape[0] - 1)
+            return _position_scores_per_sequence(rows, tables, index, cu_seqlens, max_seqlen)
+
         pos_key = pos_query = None
         if pos_key_layer is not None:
-            pos_key = _position_scores(q, position_table(pos_key_layer, H, ATT_SPAN))
+            pos_key = scores(q, pos_key_layer, pos_key_index, cu_seqlens_q, max_seqlen_q)
         if pos_query_layer is not None:
-            pos_query = _position_scores(k, position_table(pos_query_layer, H, ATT_SPAN))
+            pos_query = scores(k, pos_query_layer, pos_query_index, cu_seqlens_k, max_seqlen_k)
 
         config = get_fwd_config(BM, max_seqlen_q, max_seqlen_k, D, causal, disentangled=True, att_span=ATT_SPAN)
         o, L = flash_attn_v2_fwd_dise(
@@ -715,10 +793,13 @@ class FlashAttentionDisentangledVarlen(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.positions = positions
         ctx.plan_shape = (plan_m, plan_n)
+        ctx.per_sequence_tables = pos_key_index is not None or pos_query_index is not None
         return o
 
     @staticmethod
     def backward(ctx, grad_output):
+        if ctx.per_sequence_tables:
+            raise NotImplementedError("backward through per-sequence position tables is not supported")
         q, k, v, pos_key_layer, pos_query_layer, o, L, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
         ATT_SPAN = ctx.ATT_SPAN
         BM, H, D = q.shape
@@ -762,15 +843,16 @@ class FlashAttentionDisentangledVarlen(torch.autograd.Function):
 
         # Match forward signature: (q, k, v, pos_key_layer, pos_query_layer, cu_seqlens_q, cu_seqlens_k,
         # max_seqlen_q, max_seqlen_k, causal, sm_scale, position_buckets, max_relative_distance,
-        # positions, position_span)
+        # positions, position_span, pos_key_index, pos_query_index)
         return (dq, dk, dv, d_pos_key_layer, d_pos_query_layer, None, None, None, None, None, None, None, None,
-                None, None)
+                None, None, None, None)
 
 
 def flash_attention_with_disentangled_varlen(
     q, k, v, pos_key_layer, pos_query_layer, cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k, causal=False, sm_scale=None,
     position_buckets=0, max_relative_distance=0, positions=None, position_span=None,
+    pos_key_index=None, pos_query_index=None,
 ):
     """
     Flash attention with DeBERTa-style disentangled attention for variable-length sequences.
@@ -790,6 +872,8 @@ def flash_attention_with_disentangled_varlen(
         positions: optional (BM,) integer position of every packed token; the relative distance of a pair
             is ``positions[i] - positions[j]``. Unique inside a sequence, in ``[0, position_span)``.
         position_span: exclusive upper bound of ``positions``; read from the tensor when omitted (one sync).
+        pos_key_index / pos_query_index: optional (B,) table of every sequence. The matching layer is then
+            (S, H, 2*ATT_SPAN, D): S tables, e.g. one per LoRA adapter. Inference only.
 
     Returns:
         Output tensor of shape (BM, H, D)
@@ -797,5 +881,6 @@ def flash_attention_with_disentangled_varlen(
     return FlashAttentionDisentangledVarlen.apply(
         q, k, v, pos_key_layer, pos_query_layer, cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, causal, sm_scale,
-        position_buckets, max_relative_distance, positions, position_span
+        position_buckets, max_relative_distance, positions, position_span,
+        pos_key_index, pos_query_index,
     )

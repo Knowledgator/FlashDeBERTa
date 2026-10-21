@@ -28,7 +28,7 @@ import triton.language as tl
 
 from .config import forward_config, backward_configs
 from .launch import launch, clear_launch_cache
-from .position import (position_plan, position_table, fold_matrix, fold_band_gradients,
+from .position import (position_plan, position_table, per_sequence_tables, fold_matrix, fold_band_gradients,
                        clear_position_cache, prepare_positions)
 
 def cdiv(a, b):
@@ -649,7 +649,8 @@ def _head_rows(layer):
 class FlashAttentionDisentangled(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal,
-                sm_scale, position_buckets, max_relative_distance, positions=None, position_span=None):
+                sm_scale, position_buckets, max_relative_distance, positions=None, position_span=None,
+                pos_key_index=None, pos_query_index=None):
 
         Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Dq == Dk == Dv, "Query, key, and value must have the same head dimension"
@@ -666,11 +667,15 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         plan = position_plan(plan_m, plan_n, position_buckets, max_relative_distance, ATT_SPAN, q.device)
 
         # C2P/P2C scores are plain GEMMs; the kernel gathers them per (query, key) pair.
-        pos_key = pos_query = None
-        if pos_key_layer is not None:
-            pos_key = torch.matmul(q, position_table(pos_key_layer, H, ATT_SPAN).transpose(-1, -2))
-        if pos_query_layer is not None:
-            pos_query = torch.matmul(k, position_table(pos_query_layer, H, ATT_SPAN).transpose(-1, -2))
+        def scores(rows, layer, index):
+            if index is None:
+                table = position_table(layer, H, ATT_SPAN)                  # (H, R, D), shared
+            else:
+                table = per_sequence_tables(layer, index, H, ATT_SPAN, B)   # (B, H, R, D)
+            return torch.matmul(rows, table.transpose(-1, -2))
+
+        pos_key = scores(q, pos_key_layer, pos_key_index) if pos_key_layer is not None else None
+        pos_query = scores(k, pos_query_layer, pos_query_index) if pos_query_layer is not None else None
 
         BLOCK_M, BLOCK_N, num_stages, num_warps = get_fwd_config(
             B, H, M, N, D, causal, disentangled=True, att_span=ATT_SPAN
@@ -691,10 +696,13 @@ class FlashAttentionDisentangled(torch.autograd.Function):
         ctx.ATT_SPAN = ATT_SPAN
         ctx.positions = positions
         ctx.plan_shape = (plan_m, plan_n)
+        ctx.per_sequence_tables = pos_key_index is not None or pos_query_index is not None
         return o
 
     @staticmethod
     def backward(ctx, do):
+        if ctx.per_sequence_tables:
+            raise NotImplementedError("backward through per-sequence position tables is not supported")
         q, k, v, pos_key_layer, pos_query_layer, o, L = ctx.saved_tensors
         causal = ctx.causal
         ATT_SPAN = ctx.ATT_SPAN
@@ -738,12 +746,12 @@ class FlashAttentionDisentangled(torch.autograd.Function):
             dk = dk + grad_rows.view(H, B, N, D).permute(1, 0, 2, 3)
             d_pos_query_layer = grad_table.view(pos_query_layer.shape)
 
-        return dq, dk, dv, None, d_pos_key_layer, d_pos_query_layer, None, None, None, None, None, None
+        return dq, dk, dv, None, d_pos_key_layer, d_pos_query_layer, None, None, None, None, None, None, None, None
 
 
 def flash_attention_with_disentangled(q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal=False,
                                       sm_scale=None, position_buckets=0, max_relative_distance=0,
-                                      positions=None, position_span=None):
+                                      positions=None, position_span=None, pos_key_index=None, pos_query_index=None):
     """
     Exact DeBERTa disentangled attention.
 
@@ -756,7 +764,9 @@ def flash_attention_with_disentangled(q, k, v, seq_lengths, pos_key_layer, pos_q
             ``positions[i] - positions[j]`` instead of ``i - j``, e.g. ``row * stride + column`` for an image
             grid. Positions must be unique inside a sequence and lie in ``[0, position_span)``.
         position_span: exclusive upper bound of ``positions``; read from the tensor when omitted (one sync).
+        pos_key_index / pos_query_index: optional (B,) table of every sequence. The matching layer is then
+            (S, H, 2 * ATT_SPAN, D): S tables, e.g. one per LoRA adapter. Inference only.
     """
     return FlashAttentionDisentangled.apply(q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal,
                                             sm_scale, position_buckets, max_relative_distance,
-                                            positions, position_span)
+                                            positions, position_span, pos_key_index, pos_query_index)

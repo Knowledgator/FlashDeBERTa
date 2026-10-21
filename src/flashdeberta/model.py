@@ -227,17 +227,30 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
         super().__init__(*args, **kwargs)
 
     def _position_layers(self, rel_embeddings):
-        """Projected relative embeddings (1, NH, 2 * span, head_dim) for c2p and p2c, or None."""
+        """Projected relative embeddings for c2p and p2c, each as ``(layer, index)`` or ``(None, None)``.
+
+        ``layer`` is (1, NH, 2 * span, head_dim), shared by the batch. A projection may instead offer
+        ``project_shared(x) -> (out, index)`` (e.g. a multi-LoRA linear): ``out`` (S, 2 * span, hidden)
+        holds S projections and ``index`` (B,) picks one per sequence, or is None when S == 1.
+        """
+        none = (None, None)
         if not self.relative_attention:
-            return None, None
+            return none, none
         rel_embeddings = self.pos_dropout(rel_embeddings).unsqueeze(0)
-        project = lambda proj: _transform_for_scores(proj(rel_embeddings), self.num_attention_heads)
-        pos_key_layer = pos_query_layer = None
+
+        def project(proj):
+            if hasattr(proj, "project_shared"):
+                out, index = proj.project_shared(rel_embeddings)
+            else:
+                out, index = proj(rel_embeddings), None
+            return _transform_for_scores(out, self.num_attention_heads), index
+
+        pos_key = pos_query = none
         if "c2p" in self.pos_att_type:
-            pos_key_layer = project(self.key_proj if self.share_att_key else self.pos_key_proj)
+            pos_key = project(self.key_proj if self.share_att_key else self.pos_key_proj)
         if "p2c" in self.pos_att_type:
-            pos_query_layer = project(self.query_proj if self.share_att_key else self.pos_query_proj)
-        return pos_key_layer, pos_query_layer
+            pos_query = project(self.query_proj if self.share_att_key else self.pos_query_proj)
+        return pos_key, pos_query
 
     def forward(self, hidden_states,
                     attention_mask,
@@ -266,7 +279,7 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 
         scale_factor = 1 + ("c2p" in self.pos_att_type) + ("p2c" in self.pos_att_type)
         sm_scale = 1 / math.sqrt(self.attention_head_size * scale_factor)
-        pos_key_layer, pos_query_layer = self._position_layers(rel_embeddings)
+        (pos_key_layer, pos_key_index), (pos_query_layer, pos_query_index) = self._position_layers(rel_embeddings)
 
         query_layer = self.query_proj(query_states)
         key_layer = self.key_proj(hidden_states)
@@ -284,6 +297,8 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                 False, sm_scale,
                 self.position_buckets,
                 self.max_relative_positions,
+                pos_key_index=pos_key_index,
+                pos_query_index=pos_query_index,
             )
             return (out.reshape(T, self.all_head_size), None)
 
@@ -297,6 +312,8 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
             False, sm_scale,
             self.position_buckets,
             self.max_relative_positions,
+            pos_key_index=pos_key_index,
+            pos_query_index=pos_query_index,
         )
         out = out.view(B, self.num_attention_heads, L, self.attention_head_size).transpose(1, 2).reshape(B, L, self.all_head_size)
         return (out, None)
