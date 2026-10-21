@@ -174,6 +174,10 @@ def test_varlen_has_no_host_sync():
                                                        L, L, False, SM_SCALE, SPAN, MAX_REL)
         out.backward(torch.ones_like(out))
 
+    _assert_no_host_sync(step)
+
+
+def _assert_no_host_sync(step):
     step()  # first call builds and uploads the position plan
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
@@ -181,6 +185,23 @@ def test_varlen_has_no_host_sync():
         step()
     finally:
         torch.cuda.set_sync_debug_mode("default")
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("with_positions", [False, True])
+def test_fixed_length_has_no_host_sync(causal, with_positions):
+    B, L = 3, 700
+    (q, k, v, pk, pq), lengths, _ = make_inputs(B, L, torch.float16, padded=True)
+    q, k, v, pk, pq = (t.requires_grad_() for t in (q, k, v, pk, pq))
+    # Custom positions need an explicit span, otherwise their maximum is read back (documented sync).
+    extra = (torch.arange(L, device="cuda", dtype=torch.int32).expand(B, L).contiguous(), L) if with_positions else ()
+
+    def step():
+        out = flash_attention_with_disentangled(q, k, v, None if causal else lengths, pk, pq,
+                                                causal, SM_SCALE, SPAN, MAX_REL, *extra)
+        out.backward(torch.ones_like(out))
+
+    _assert_no_host_sync(step)
 
 
 @pytest.mark.parametrize("L", [16, 300, 2048])
