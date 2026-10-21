@@ -25,8 +25,7 @@ import math
 import torch
 import triton
 import triton.language as tl
-import functools
-from typing import Tuple, Dict, Any
+from typing import Tuple
 
 from .config import forward_config, backward_configs
 from .launch import launch, clear_launch_cache
@@ -36,86 +35,32 @@ from .position import (position_plan, position_table, fold_matrix, fold_band_gra
 def cdiv(a, b):
     return (a + b - 1) // b
 
-def get_mid(cu_seqlens_q, B, BLOCK_M):
-    mid_batch = []
-    mid_start = []
-    MN = 0
-    for batch in range(B):
-        q_start = cu_seqlens_q[batch]
-        q_end = cu_seqlens_q[batch+1]
-        n_batch_blocks = (q_end-q_start+BLOCK_M-1).item()//BLOCK_M
-        MN+=n_batch_blocks
-        for block in range(n_batch_blocks):
-            mid_start.append(q_start+(block)*BLOCK_M)
-            mid_batch.append(batch)
-    return (mid_batch, mid_start, MN)
+def tile_map(cu_seqlens: torch.Tensor, num_tokens: int, block: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Map every program of a varlen launch to (sequence, first packed row), built on the GPU.
 
+    Sequence ``b`` needs ``ceil(len_b / block)`` tiles. Their total is at most
+    ``ceil(num_tokens / block) + B``, which is known on the host, so the grid uses
+    that bound and no device-to-host sync is needed. Programs past the last real
+    tile get sequence ``-1`` and exit at once.
 
-@functools.lru_cache(maxsize=256)
-def _get_mid_cached(cu_seqlens_tuple: Tuple[int, ...], B: int, BLOCK_M: int) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
+    Returns ``(tile_batch, tile_start, grid)``, both tensors of shape ``(grid,)``.
     """
-    Cached version of get_mid that works with hashable tuple input.
-    Returns tuples instead of lists for cacheability.
-    """
-    mid_batch = []
-    mid_start = []
-    MN = 0
-    for batch in range(B):
-        q_start = cu_seqlens_tuple[batch]
-        q_end = cu_seqlens_tuple[batch + 1]
-        n_batch_blocks = (q_end - q_start + BLOCK_M - 1) // BLOCK_M
-        MN += n_batch_blocks
-        for block in range(n_batch_blocks):
-            mid_start.append(q_start + block * BLOCK_M)
-            mid_batch.append(batch)
-    return (tuple(mid_batch), tuple(mid_start), MN)
-
-
-# Global tensor cache for mid tensors (avoid repeated CPU->GPU transfers)
-_mid_tensor_cache: Dict[Tuple[Any, ...], Tuple[torch.Tensor, torch.Tensor, int]] = {}
-
-
-@torch.compiler.disable
-def get_mid_cached(cu_seqlens: torch.Tensor, B: int, BLOCK_M: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """
-    Get cached mid_batch and mid_start tensors.
-    Caches both the computation and the GPU tensors to avoid repeated allocations.
-
-    Note: Disabled for torch.compile as it involves CPU operations.
-    """
-    # Create cache key from cu_seqlens values
-    cu_tuple = tuple(cu_seqlens.tolist())
-    cache_key = (cu_tuple, B, BLOCK_M, device)
-
-    if cache_key in _mid_tensor_cache:
-        return _mid_tensor_cache[cache_key]
-
-    # Compute using cached function
-    mid_batch_tuple, mid_start_tuple, MN = _get_mid_cached(cu_tuple, B, BLOCK_M)
-
-    # Create tensors on device
-    mid_batch = torch.tensor(mid_batch_tuple, dtype=torch.long, device=device)
-    mid_start = torch.tensor(mid_start_tuple, dtype=torch.long, device=device)
-
-    # Cache the result (limit cache size)
-    if len(_mid_tensor_cache) > 512:
-        # Simple eviction: clear half the cache
-        keys_to_remove = list(_mid_tensor_cache.keys())[:256]
-        for k in keys_to_remove:
-            del _mid_tensor_cache[k]
-
-    _mid_tensor_cache[cache_key] = (mid_batch, mid_start, MN)
-    return mid_batch, mid_start, MN
+    B = cu_seqlens.numel() - 1
+    grid = cdiv(num_tokens, block) + B
+    cu = cu_seqlens.long()
+    tiles = (cu[1:] - cu[:-1] + block - 1) // block
+    ends = tiles.cumsum(0)
+    z = torch.arange(grid, device=cu.device)
+    batch = torch.searchsorted(ends, z, right=True)
+    valid = batch < B
+    batch = batch.clamp_(max=B - 1)
+    start = cu[batch] + (z - (ends[batch] - tiles[batch])) * block
+    return torch.where(valid, batch, -1), start, grid
 
 
 def clear_mid_cache():
-    """
-    Clear the mid tensor cache. Call this if memory is a concern.
-    Note: This only clears the mid tensor cache, not the config caches.
-    Use clear_config_cache_varlen() to clear config caches.
-    """
-    _mid_tensor_cache.clear()
-    _get_mid_cached.cache_clear()
+    """Kept for compatibility: tile maps are built on the GPU per call and are not cached."""
+
 
 def clear_config_cache_varlen():
     """Clear cached launch configs and position plans."""
@@ -123,8 +68,7 @@ def clear_config_cache_varlen():
     clear_position_cache()
 
 def clear_all_varlen_caches():
-    """Clear all caches for varlen kernels (mid tensors, launch configs and position plans)."""
-    clear_mid_cache()
+    """Clear all caches for varlen kernels (launch configs and position plans)."""
     clear_config_cache_varlen()
 
 
@@ -155,6 +99,8 @@ def _fwd_kernel_deberta_disentangled_attention(
     off_h = tl.program_id(1)
     off_b = tl.load(mid_batch + start_z)
     off_m = tl.load(mid_start + start_z)
+    if off_b < 0:
+        return  # grid is an upper bound on the tile count
 
     q_start = tl.load(cu_seqlens_q + off_b)
     q_end = tl.load(cu_seqlens_q + off_b + 1)
@@ -296,7 +242,7 @@ def flash_attn_v2_fwd_dise(q, k, v, pos_key, pos_query, pos_lut, cu_seqlens_q, c
 
     def make_launch(block_m, block_n):
         # Programs are tiles of one sequence: the tile map depends on BLOCK_M.
-        mid_batch, mid_start, MN = get_mid_cached(cu_seqlens_q, B, block_m, q.device)
+        mid_batch, mid_start, MN = tile_map(cu_seqlens_q, Z, block_m)
         args = (
             q, k, v,
             pos_key, pos_query, pos_lut, positions,
@@ -336,6 +282,8 @@ def _bwd_preprocess_varlen(
 
     off_b = tl.load(mid_batch + tile_m)
     off_m = tl.load(mid_start + tile_m)  # absolute token start in Q (flattened)
+    if off_b < 0:
+        return  # grid is an upper bound on the tile count
 
     q_start = tl.load(cu_seqlens_q + off_b)
     q_end   = tl.load(cu_seqlens_q + off_b + 1)
@@ -396,6 +344,8 @@ def _bwd_kv_dise_kernel_varlen(
 
     off_b   = tl.load(mid_batch_n + tile_n)
     n_start = tl.load(mid_start_n + tile_n)   # absolute start index in K/V (flattened)
+    if off_b < 0:
+        return  # grid is an upper bound on the tile count
 
     q_start = tl.load(cu_seqlens_q + off_b)
     q_end   = tl.load(cu_seqlens_q + off_b + 1)
@@ -523,6 +473,8 @@ def _bwd_q_dise_kernel_varlen(
 
     off_b = tl.load(mid_batch_m + tile_m)
     off_m = tl.load(mid_start_m + tile_m)   # absolute q start for this tile
+    if off_b < 0:
+        return  # grid is an upper bound on the tile count
 
     q_start = tl.load(cu_seqlens_q + off_b)
     q_end   = tl.load(cu_seqlens_q + off_b + 1)
@@ -644,7 +596,7 @@ def flash_attn_v2_bwd_dise_varlen(
     # Δ: (BM, H), L: (BM, H)  — matches kernel pointer math
     delta = torch.empty((BM, H), device=device, dtype=torch.float32)
     PRE_BLOCK_M = 64
-    mid_m_batch, mid_m_start, MN = get_mid_cached(cu_seqlens_q, B, PRE_BLOCK_M, device)
+    mid_m_batch, mid_m_start, MN = tile_map(cu_seqlens_q, BM, PRE_BLOCK_M)
     with torch.cuda.device(q.device.index):
         _bwd_preprocess_varlen[(MN, H)](
             o, do, delta,
@@ -669,7 +621,7 @@ def flash_attn_v2_bwd_dise_varlen(
     key = (D, q.dtype, causal, has_c2p, has_p2c, has_positions)
 
     def make_kv_launch(block_m, block_n):
-        mid_n_batch, mid_n_start, NK = get_mid_cached(cu_seqlens_k, B, block_n, device)
+        mid_n_batch, mid_n_start, NK = tile_map(cu_seqlens_k, BN, block_n)
         args = (
             q, k, v, k_pos, q_pos, pos_lut, positions, sm_scale, do,
             dk, dv, p2c_band,
@@ -689,7 +641,7 @@ def flash_attn_v2_bwd_dise_varlen(
         return (NK, H), args, kwargs
 
     def make_q_launch(block_m, block_n):
-        mid_batch, mid_start, MN = get_mid_cached(cu_seqlens_q, B, block_m, device)
+        mid_batch, mid_start, MN = tile_map(cu_seqlens_q, BM, block_m)
         args = (
             q, k, v, k_pos, q_pos, pos_lut, positions, sm_scale, do,
             dq, c2p_band,

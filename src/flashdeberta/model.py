@@ -3,6 +3,7 @@ import logging
 import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import (LayerNorm, CrossEntropyLoss, MSELoss, BCEWithLogitsLoss)
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import (BaseModelOutput, MaskedLMOutput, SequenceClassifierOutput,
@@ -22,7 +23,7 @@ from transformers.models.deberta_v2.modeling_deberta_v2 import (DisentangledSelf
                                             )
 from transformers.utils import logging
 
-from .padding import _upad_input, pad_input
+from .padding import index_first_axis, pad_input
 from .ops.flash_attention import flash_attention_with_disentangled
 from .ops.flash_attention_varlen import flash_attention_with_disentangled_varlen
 
@@ -167,6 +168,40 @@ class DebertaV2Config(PretrainedConfig):
         self.pooler_hidden_act = pooler_hidden_act
         self.legacy = legacy
 
+class _VarlenInfo:
+    """Packing data for one padded batch, shared by every layer of a forward pass."""
+
+    def __init__(self, attention_mask):
+        if attention_mask.dim() == 4:
+            mask_2d = attention_mask[:, 0].sum(dim=-1) > 0   # [B, 1, L, L] -> [B, L]
+        elif attention_mask.dim() == 3:
+            mask_2d = attention_mask.sum(dim=-1) > 0         # [B, L, L] -> [B, L]
+        else:
+            mask_2d = attention_mask > 0
+        self.mask_2d = mask_2d
+        self.lengths = mask_2d.sum(dim=-1, dtype=torch.int32)
+        self.version = attention_mask._version
+        self._packed = None
+
+    def packed(self):
+        """(indices, cu_seqlens, has_padding). ``nonzero`` is the one host sync, done once."""
+        if self._packed is None:
+            indices = torch.nonzero(self.mask_2d.flatten(), as_tuple=False).flatten()
+            cu_seqlens = F.pad(self.lengths.cumsum(0, dtype=torch.int32), (1, 0))
+            self._packed = (indices, cu_seqlens, indices.numel() < self.mask_2d.numel())
+        return self._packed
+
+
+@torch.compiler.disable
+def _varlen_info(attention_mask):
+    # All layers receive the same mask tensor, so cache on it (and drop it if edited in place).
+    info = getattr(attention_mask, "_flashdeberta_varlen", None)
+    if info is None or info.version != attention_mask._version:
+        info = _VarlenInfo(attention_mask)
+        attention_mask._flashdeberta_varlen = info
+    return info
+
+
 class FlashDisentangledSelfAttention(DisentangledSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -192,20 +227,17 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
         Returns:
             Tuple[Tensor, None]: A tuple where the first element is the output tensor of shape (B, L, hidden_size).
         """
-        if attention_mask is not None:
-            total_length = torch.sum(attention_mask)
-            max_length = torch.prod(torch.tensor(attention_mask.shape).to(attention_mask.device))
-            if max_length==total_length:
-                varlen = False
-            else:
-                varlen = True
-        else:
-            varlen = False
-
         if query_states is None:
             query_states = hidden_states
 
         B, L, _ = hidden_states.shape
+
+        # Short batches use the padded kernel with per-row lengths (no sync).
+        # Long padded batches are packed: one `nonzero` sync per forward, shared by all layers.
+        varlen_info = _varlen_info(attention_mask) if attention_mask is not None else None
+        varlen = False
+        if varlen_info is not None and L >= 1024:
+            indices, cu_seqlens, varlen = varlen_info.packed()
 
         query_layer = self.query_proj(query_states)
         key_layer = self.key_proj(hidden_states)
@@ -246,29 +278,16 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
 
 
         causal = False
-        if not varlen or L<1024:
+        if not varlen:
             query_layer = _transform_for_scores(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
             key_layer = _transform_for_scores(key_layer, self.num_attention_heads)
             value_layer = _transform_for_scores(value_layer, self.num_attention_heads)
-
-            # Compute sequence lengths from attention mask if available
-            seq_lengths = None
-            if varlen and attention_mask is not None:
-                if attention_mask.dim() == 4:
-                    # [B, 1, L, L] -> [B, L] -> sum per batch
-                    seq_lengths = (attention_mask[:, 0, 0, :] > 0).sum(dim=-1).to(torch.int32)
-                elif attention_mask.dim() == 3:
-                    # [B, L, L] -> sum per batch
-                    seq_lengths = (attention_mask[:, 0, :] > 0).sum(dim=-1).to(torch.int32)
-                elif attention_mask.dim() == 2:
-                    # [B, L] -> sum per batch
-                    seq_lengths = (attention_mask > 0).sum(dim=-1).to(torch.int32)
 
             out = flash_attention_with_disentangled(
                 query_layer,
                 key_layer,
                 value_layer,
-                seq_lengths,
+                varlen_info.lengths if varlen_info is not None else None,
                 pos_key_layer if "c2p" in self.pos_att_type else None,
                 pos_query_layer if "p2c" in self.pos_att_type else None,
                 causal,
@@ -277,54 +296,25 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                 self.max_relative_positions,
             )
         else:
-            query_layer = _get_heads(query_layer, self.num_attention_heads) # (B, L, NH, head_dim)
-            key_layer = _get_heads(key_layer, self.num_attention_heads)
-            value_layer = _get_heads(value_layer, self.num_attention_heads)
+            # (B, L, H*D) -> packed (T, NH, head_dim)
+            pack = lambda t: index_first_axis(t.reshape(B * L, self.num_attention_heads, -1), indices)
 
-            # Convert 4D attention_mask [B, 1, L, L] to 2D [B, L] for _upad_input
-            if attention_mask.dim() == 4:
-                mask_2d = attention_mask[:, 0, :, :].sum(dim=-1) > 0
-            elif attention_mask.dim() == 3:
-                # [B, L, L] -> [B, L]
-                mask_2d = attention_mask.sum(dim=-1) > 0
-            else:
-                # Already 2D [B, L]
-                mask_2d = attention_mask
-
-            (query_layer,
-             key_layer,
-             value_layer,
-             _,
-             _,
-             indices_q,
-             cu_seq_lens,
-             max_seq_lens) = _upad_input(
-                query_layer,
-                key_layer,
-                value_layer,
-                None,
-                None,
-                mask_2d,
-                L,
-                self.num_attention_heads)
-
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
+            # max_seqlen only sizes the position lookup table, so the padded length L
+            # is a valid bound and avoids reading the true maximum back from the GPU.
             out_unpad = flash_attention_with_disentangled_varlen(
-                query_layer,
-                key_layer,
-                value_layer,
+                pack(query_layer),
+                pack(key_layer),
+                pack(value_layer),
                 pos_key_layer if "c2p" in self.pos_att_type else None,
                 pos_query_layer if "p2c" in self.pos_att_type else None,
-                cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_in_batch_q, max_seqlen_in_batch_k,
+                cu_seqlens, cu_seqlens,
+                L, L,
                 causal,
                 sm_scale,
                 self.position_buckets,
                 self.max_relative_positions,
             )
-            out = pad_input(out_unpad, indices_q, B, L).view(B, L, self.all_head_size)
+            out = pad_input(out_unpad, indices, B, L).view(B, L, self.all_head_size)
             return (out, None)
         out = out.view(B, self.num_attention_heads, L, self.attention_head_size).transpose(1, 2).reshape(B, L, self.all_head_size)
         return (out, None)

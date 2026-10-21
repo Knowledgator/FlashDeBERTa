@@ -131,6 +131,58 @@ def test_varlen(dtype, B, L):
     assert_close(run(kernel, inputs, grad_out), run(dense, inputs, grad_out, torch.float64), dtype)
 
 
+def _varlen_case(lengths, L, dtype):
+    B = len(lengths)
+    inputs, _, grad_out = make_inputs(B, L, dtype, padded=False)
+    lengths = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    keep = torch.arange(L, device="cuda")[None, :] < lengths[:, None]
+    grad_out = grad_out * keep[:, None, :, None]
+    tokens = keep.flatten().nonzero().flatten()
+    cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+
+    def kernel(q, k, v, pk, pq):
+        pack = lambda t: t.transpose(1, 2).reshape(B * L, H, D)[tokens]
+        out = flash_attention_with_disentangled_varlen(pack(q), pack(k), pack(v), pk, pq, cu_seqlens, cu_seqlens,
+                                                       L, L, False, SM_SCALE, SPAN, MAX_REL)
+        full = torch.zeros(B * L, H, D, device="cuda", dtype=out.dtype).index_copy(0, tokens, out)
+        return full.view(B, L, H, D).transpose(1, 2)
+
+    def dense(q, k, v, pk, pq):
+        return reference(q, k, v, pk, pq, lengths, causal=False)
+
+    return inputs, grad_out, kernel, dense
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_varlen_tile_boundaries(dtype):
+    # Lengths on and around tile edges, including a single-token sequence.
+    inputs, grad_out, kernel, dense = _varlen_case([300, 1, 63, 64, 65, 129, 17], 300, dtype)
+    assert_close(run(kernel, inputs, grad_out), run(dense, inputs, grad_out, torch.float64), dtype)
+
+
+def test_varlen_has_no_host_sync():
+    L = 1100
+    q, k, v, pk, pq = (t.detach().requires_grad_() for t in make_inputs(3, L, torch.float16, padded=False)[0])
+    lengths = torch.tensor([L, 700, 333], device="cuda", dtype=torch.int32)
+    cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+    T = int(lengths.sum())
+    pack = lambda t: t.detach()[0, :, :T].transpose(0, 1).contiguous().requires_grad_()
+    q, k, v = pack(q), pack(k), pack(v)
+
+    def step():
+        out = flash_attention_with_disentangled_varlen(q, k, v, pk, pq, cu_seqlens, cu_seqlens,
+                                                       L, L, False, SM_SCALE, SPAN, MAX_REL)
+        out.backward(torch.ones_like(out))
+
+    step()  # first call builds and uploads the position plan
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        step()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
 @pytest.mark.parametrize("L", [16, 300, 2048])
 def test_position_plan_band_covers_every_distance(L):
     plan = position_plan(L, L, SPAN, MAX_REL, SPAN, "cuda")
