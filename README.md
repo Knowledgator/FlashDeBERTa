@@ -42,6 +42,39 @@ In order to switch to eager attention implementation, initialise a model in the 
 model = FlashDebertaV2Model.from_pretrained("microsoft/deberta-v3-base", _attn_implementation='eager').to('cuda')
 ```
 
+### Padding 📦
+
+When a batch contains padding, the encoder removes it once, runs every layer only on the real tokens and
+restores the padded `(batch, seq_len, hidden)` shape at the end. Projections, FFN and attention all skip padding,
+which is about 2x faster on a half-padded batch. Outputs at padding positions are zeros.
+
+Packing is used only when **all** of these hold:
+
+1. `config.unpad_inputs` is `True` (the default).
+2. The attention mask is 2D, `(batch, seq_len)`.
+3. No `query_states` are passed (they are only used when `z_steps > 1`).
+4. The mask contains at least one `0`.
+
+Otherwise the model runs in padded mode:
+
+| Situation | Mode |
+|---|---|
+| 2D mask with padding, default config | packed |
+| `config.unpad_inputs = False` (at load time or at runtime) | padded (forced) |
+| Mask of all `1`s, or no mask | padded: there is nothing to remove |
+| 3D `(batch, seq_len, seq_len)` or 4D `(batch, 1, seq_len, seq_len)` mask | padded: a custom attention pattern can't be packed |
+| `query_states` given (`z_steps > 1`) | padded |
+
+The decision is made once per forward pass. Checking the mask for padding is the one GPU→CPU sync in packed mode;
+padded mode has none.
+
+To force padded mode, turn packing off at load time or at runtime:
+```python
+model = FlashDebertaV2Model.from_pretrained("microsoft/deberta-v3-base", unpad_inputs=False).to('cuda')
+model.config.unpad_inputs = True  # switch back
+```
+Padded mode expects right padding; packed mode works with any 2D padding mask.
+
 ### Kernel Tuning ⚙️
 
 FlashDeBERTa ships kernel parameters measured on an RTX 5060 Ti (BF16, head dim 64): the kernels are bound by position-score gathers, so small tiles with a single pipeline stage are fastest. If a configuration does not fit your GPU's shared memory, it is shrunk automatically at launch. You can override the defaults with environment variables:

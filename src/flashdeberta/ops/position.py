@@ -53,6 +53,35 @@ def make_log_bucket_position(relative_pos, bucket_size: int, max_position: int):
     return torch.where(abs_pos <= mid, relative_pos.type_as(log_pos), log_pos * sign)
 
 
+_BUILDER = None
+
+
+def _cached_on_device(build, device):
+    """Run ``build()`` (which creates the device tensors of a cache entry) outside CUDA graph pools.
+
+    Plans are cached across calls. CUDA graph trees (``torch.compile(mode="reduce-overhead")``) warm
+    a graph up with every allocation of the calling thread routed to their memory pool, and refuse
+    to record when a tensor allocated there outlives the run. Building on a helper thread keeps cache
+    entries in the regular allocator; the device sync after it is paid once per new entry. Entries
+    are built on first use, before capture, so a capture only hits the cache.
+    """
+    global _BUILDER
+    device = torch.device(device)
+    if device.type != "cuda":
+        return build()
+    if _BUILDER is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _BUILDER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="flashdeberta-plan")
+
+    def run():
+        with torch.cuda.device(device):
+            result = build()
+            torch.cuda.current_stream(device).synchronize()
+        return result
+
+    return _BUILDER.submit(run).result()
+
+
 class PositionPlan(NamedTuple):
     lut: torch.Tensor           # int32 [M + N - 1]: slot of distance u = i - j + N - 1
     band_low: int               # distances u <= band_low share column 0
@@ -60,7 +89,9 @@ class PositionPlan(NamedTuple):
     column_slots: torch.Tensor  # int64 [num_columns]: slot of each band column
 
 
-@functools.lru_cache(maxsize=256)
+# Unbounded on purpose: a recorded CUDA graph keeps raw pointers to these tensors, so an entry must
+# never be freed while a graph may replay. Entries are small, one per distinct (M, N, buckets) shape.
+@functools.lru_cache(maxsize=None)
 def _position_plan(M, N, position_buckets, max_relative_distance, att_span, device):
     deltas = torch.arange(-(N - 1), M, dtype=torch.long)
     if position_buckets > 0:
@@ -79,12 +110,10 @@ def _position_plan(M, N, position_buckets, max_relative_distance, att_span, devi
     high = max(high, low + 1)
     columns = [values[0], *values[low + 1:high], values[last]]
 
-    return PositionPlan(
-        lut=slots.to(device=device, dtype=torch.int32),
-        band_low=low,
-        num_columns=len(columns),
-        column_slots=torch.tensor(columns, dtype=torch.long, device=device),
-    )
+    lut, column_slots = _cached_on_device(
+        lambda: (slots.to(device=device, dtype=torch.int32), torch.tensor(columns, dtype=torch.long, device=device)),
+        device)
+    return PositionPlan(lut=lut, band_low=low, num_columns=len(columns), column_slots=column_slots)
 
 
 def position_plan(M, N, position_buckets, max_relative_distance, att_span, device):
@@ -92,11 +121,15 @@ def position_plan(M, N, position_buckets, max_relative_distance, att_span, devic
                           int(att_span), torch.device(device))
 
 
-@functools.lru_cache(maxsize=256)
+@functools.lru_cache(maxsize=None)
 def _fold_matrix(M, N, position_buckets, max_relative_distance, att_span, device, dtype):
     plan = _position_plan(M, N, position_buckets, max_relative_distance, att_span, device)
-    slots = torch.arange(2 * att_span, device=device)
-    return (plan.column_slots[:, None] == slots[None, :]).to(dtype)
+
+    def build():
+        slots = torch.arange(2 * att_span, device=device)
+        return (plan.column_slots[:, None] == slots[None, :]).to(dtype)
+
+    return _cached_on_device(build, device)
 
 
 def fold_matrix(M, N, position_buckets, max_relative_distance, att_span, device, dtype):
@@ -117,6 +150,26 @@ def position_table(table, num_heads, att_span):
     if table.shape[1] != 2 * att_span:
         raise ValueError(f"position table has {table.shape[1]} rows, expected 2 * att_span = {2 * att_span}")
     return table
+
+
+def position_tables(table, index, num_heads, att_span, num_sequences):
+    """Validate (S, H, 2 * att_span, D) tables and the (B,) table index of every sequence.
+
+    Lets sequences of one batch use different position tables, e.g. relative embeddings projected
+    by a different LoRA adapter per sequence. Inference only: the attention backward rejects them.
+    """
+    if table.dim() != 4:
+        raise ValueError("per-sequence position tables must have shape (S, H, R, D)")
+    position_table(table[:1], num_heads, att_span)  # validates heads and rows
+    if index.dim() != 1 or index.shape[0] != num_sequences:
+        raise ValueError(f"position table index must have shape ({num_sequences},), got {tuple(index.shape)}")
+    return table
+
+
+def per_sequence_tables(table, index, num_heads, att_span, num_sequences):
+    """(S, H, 2 * att_span, D) tables and (B,) index -> (B, H, 2 * att_span, D), one table per sequence."""
+    position_tables(table, index, num_heads, att_span, num_sequences)
+    return table.index_select(0, index.to(device=table.device, dtype=torch.long))
 
 
 def fold_band_gradients(band, rows, table, fold):
@@ -166,5 +219,6 @@ def positions_are_unique(positions, lengths=None):
 
 
 def clear_position_cache():
+    """Drop cached plans. Do not call while CUDA graphs recorded with them may still replay."""
     _position_plan.cache_clear()
     _fold_matrix.cache_clear()

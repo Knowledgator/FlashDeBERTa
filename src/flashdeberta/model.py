@@ -1,8 +1,10 @@
 from typing import Optional, Union, Tuple, Dict
 import logging
+from collections.abc import Sequence
 import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import (LayerNorm, CrossEntropyLoss, MSELoss, BCEWithLogitsLoss)
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import (BaseModelOutput, MaskedLMOutput, SequenceClassifierOutput,
@@ -22,13 +24,12 @@ from transformers.models.deberta_v2.modeling_deberta_v2 import (DisentangledSelf
                                             )
 from transformers.utils import logging
 
-from .padding import _upad_input, pad_input
+from .packing import COMPILED_ROW_ALIGNMENT, PackedBatch, PaddedBatch, plan_batch
 from .ops.flash_attention import flash_attention_with_disentangled
 from .ops.flash_attention_varlen import flash_attention_with_disentangled_varlen
 
 logger = logging.get_logger(__name__)
 
-@torch.jit.script
 def make_log_bucket_position(relative_pos, bucket_size: int, max_position: int):
     sign = torch.sign(relative_pos)
     mid = bucket_size // 2
@@ -76,7 +77,6 @@ def build_relative_position(query_layer, key_layer, bucket_size: int = -1, max_p
     return rel_pos_ids
 
 
-@torch.jit.script
 def scaled_size_sqrt(query_layer: torch.Tensor, scale_factor: int):
     return torch.sqrt(torch.tensor(query_layer.size(-1), dtype=torch.float) * scale_factor)
 
@@ -94,7 +94,6 @@ def _get_heads(x: torch.Tensor, attention_heads: int) -> torch.Tensor:
     x = x.view(new_x_shape).contiguous()
     return x
 
-@torch.jit.script
 def build_rpos(query_layer, key_layer, relative_pos, position_buckets: int, max_relative_positions: int):
     if key_layer.size(-2) != query_layer.size(-2):
         return build_relative_position(
@@ -131,6 +130,10 @@ class DebertaV2Config(PretrainedConfig):
         pooler_dropout=0,
         pooler_hidden_act="gelu",
         legacy=True,
+        unpad_inputs=True,
+        pack_bucket="auto",
+        pack_bucket_training=None,
+        attention_precision="native",
         _attn_implementation_autoset = True,
         _attn_implementation='eager',
         **kwargs,
@@ -151,6 +154,14 @@ class DebertaV2Config(PretrainedConfig):
         self.max_relative_positions = max_relative_positions
         self.pad_token_id = pad_token_id
         self.position_biased_input = position_biased_input
+        # Remove padding once in the encoder and run all layers on real tokens only (see FlashDebertaV2Encoder).
+        self.unpad_inputs = unpad_inputs
+        # Under torch.compile the packed token count is rounded up to a bucket (see packing.packed_capacity).
+        self.pack_bucket = pack_bucket
+        # The same in training mode; None packs exactly (compiled training does not need fixed shapes).
+        self.pack_bucket_training = pack_bucket_training
+        # "native", "fp8_qk" or "fp8_qkv": precision of the attention kernels' matmuls.
+        self.attention_precision = attention_precision
         self._attn_implementation_autoset = _attn_implementation_autoset
         self._attn_implementation = _attn_implementation
         
@@ -168,8 +179,36 @@ class DebertaV2Config(PretrainedConfig):
         self.legacy = legacy
 
 class FlashDisentangledSelfAttention(DisentangledSelfAttention):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        # "native", "fp8_qk" or "fp8_qkv"; see flashdeberta.quantization.
+        self.attention_precision = getattr(config, "attention_precision", "native")
+
+    def _position_layers(self, rel_embeddings):
+        """Projected relative embeddings for c2p and p2c, each as ``(layer, index)`` or ``(None, None)``.
+
+        ``layer`` is (1, NH, 2 * span, head_dim), shared by the batch. A projection may instead offer
+        ``project_shared(x) -> (out, index)`` (e.g. a multi-LoRA linear): ``out`` (S, 2 * span, hidden)
+        holds S projections and ``index`` (B,) picks one per sequence, or is None when S == 1.
+        """
+        none = (None, None)
+        if not self.relative_attention:
+            return none, none
+        rel_embeddings = self.pos_dropout(rel_embeddings).unsqueeze(0)
+
+        def project(proj):
+            if hasattr(proj, "project_shared"):
+                out, index = proj.project_shared(rel_embeddings)
+            else:
+                out, index = proj(rel_embeddings), None
+            return _transform_for_scores(out, self.num_attention_heads), index
+
+        pos_key = pos_query = none
+        if "c2p" in self.pos_att_type:
+            pos_key = project(self.key_proj if self.share_att_key else self.pos_key_proj)
+        if "p2c" in self.pos_att_type:
+            pos_query = project(self.query_proj if self.share_att_key else self.pos_query_proj)
+        return pos_key, pos_query
 
     def forward(self, hidden_states,
                     attention_mask,
@@ -178,154 +217,71 @@ class FlashDisentangledSelfAttention(DisentangledSelfAttention):
                     relative_pos=None,
                     rel_embeddings=None):
         """
-        Performs the flash attention forward pass with disentangled relative attention.
+        Flash attention with disentangled relative attention.
 
         Args:
-            hidden_states (Tensor): Input tensor of shape (B, L, hidden_size).
-            attention_mask (Tensor): The attention mask.
-            output_attentions (bool): Whether to return attention weights.
+            hidden_states (Tensor): (B, L, hidden_size) padded, or (T, hidden_size) when
+                ``attention_mask`` is a ``PackedBatch``.
+            attention_mask (Tensor | PaddedBatch | PackedBatch): a padding mask ((B, L), (B, L, L) or
+                (B, 1, L, L); padding must be on the right), or the batch descriptor built by the encoder.
+            output_attentions (bool): Not supported; attention weights are never returned.
             query_states (Tensor, optional): If provided, used as Q.
-            relative_pos (Tensor, optional): Relative position encoding. If None, will be built.
-            causal (bool): Whether to apply causal masking.
-            sm_scale (float, optional): Scaling factor for softmax.
+            relative_pos (Tensor, optional): Ignored; relative positions are computed in the kernel.
+            rel_embeddings (Tensor): Relative position embeddings.
 
         Returns:
-            Tuple[Tensor, None]: A tuple where the first element is the output tensor of shape (B, L, hidden_size).
+            Tuple[Tensor, None]: output of the same shape as ``hidden_states``.
         """
-        if attention_mask is not None:
-            total_length = torch.sum(attention_mask)
-            max_length = torch.prod(torch.tensor(attention_mask.shape).to(attention_mask.device))
-            if max_length==total_length:
-                varlen = False
-            else:
-                varlen = True
-        else:
-            varlen = False
-
         if query_states is None:
             query_states = hidden_states
 
-        B, L, _ = hidden_states.shape
+        scale_factor = 1 + ("c2p" in self.pos_att_type) + ("p2c" in self.pos_att_type)
+        sm_scale = 1 / math.sqrt(self.attention_head_size * scale_factor)
+        (pos_key_layer, pos_key_index), (pos_query_layer, pos_query_index) = self._position_layers(rel_embeddings)
 
         query_layer = self.query_proj(query_states)
         key_layer = self.key_proj(hidden_states)
         value_layer = self.value_proj(hidden_states)
 
-        scale_factor = 1
-        if "c2p" in self.pos_att_type:
-            scale_factor += 1
-        if "p2c" in self.pos_att_type:
-            scale_factor += 1
-
-        sm_scale = 1/math.sqrt(self.attention_head_size*scale_factor)
-
-        if self.relative_attention:
-            rel_embeddings = self.pos_dropout(rel_embeddings)
-            if self.share_att_key:
-                pos_key_layer = _transform_for_scores(
-                    self.key_proj(rel_embeddings.unsqueeze(0)), self.num_attention_heads
-                ) # (1, NH, MD, head_dim)
-                pos_query_layer = _transform_for_scores(
-                    self.query_proj(rel_embeddings.unsqueeze(0)), self.num_attention_heads
-                )
-            else:
-                if "c2p" in self.pos_att_type:
-                    pos_key_layer = _transform_for_scores(
-                        self.pos_key_proj(rel_embeddings.unsqueeze(0)), self.num_attention_heads
-                    )
-                else:
-                    pos_key_layer = None
-                if "p2c" in self.pos_att_type:
-                    pos_query_layer = _transform_for_scores(
-                        self.pos_query_proj(rel_embeddings.unsqueeze(0)), self.num_attention_heads
-                    )
-                else:
-                    pos_query_layer = None
-        else:
-            pos_key_layer, pos_query_layer = None, None
-
-
-        causal = False
-        if not varlen or L<1024:
-            query_layer = _transform_for_scores(query_layer, self.num_attention_heads) # (B, NH, L, head_dim)
-            key_layer = _transform_for_scores(key_layer, self.num_attention_heads)
-            value_layer = _transform_for_scores(value_layer, self.num_attention_heads)
-
-            # Compute sequence lengths from attention mask if available
-            seq_lengths = None
-            if varlen and attention_mask is not None:
-                if attention_mask.dim() == 4:
-                    # [B, 1, L, L] -> [B, L] -> sum per batch
-                    seq_lengths = (attention_mask[:, 0, 0, :] > 0).sum(dim=-1).to(torch.int32)
-                elif attention_mask.dim() == 3:
-                    # [B, L, L] -> sum per batch
-                    seq_lengths = (attention_mask[:, 0, :] > 0).sum(dim=-1).to(torch.int32)
-                elif attention_mask.dim() == 2:
-                    # [B, L] -> sum per batch
-                    seq_lengths = (attention_mask > 0).sum(dim=-1).to(torch.int32)
-
-            out = flash_attention_with_disentangled(
-                query_layer,
-                key_layer,
-                value_layer,
-                seq_lengths,
-                pos_key_layer if "c2p" in self.pos_att_type else None,
-                pos_query_layer if "p2c" in self.pos_att_type else None,
-                causal,
-                sm_scale,
+        if isinstance(attention_mask, PackedBatch):
+            batch = attention_mask
+            T = hidden_states.shape[0]
+            heads = lambda t: t.view(T, self.num_attention_heads, self.attention_head_size)
+            out = flash_attention_with_disentangled_varlen(
+                heads(query_layer), heads(key_layer), heads(value_layer),
+                pos_key_layer, pos_query_layer,
+                batch.cu_seqlens, batch.cu_seqlens,
+                batch.max_seqlen, batch.max_seqlen,
+                False, sm_scale,
                 self.position_buckets,
                 self.max_relative_positions,
+                pos_key_index=pos_key_index,
+                pos_query_index=pos_query_index,
+                precision=self.attention_precision,
             )
+            return (out.reshape(T, self.all_head_size), None)
+
+        if isinstance(attention_mask, PaddedBatch):
+            lengths = attention_mask.lengths
+        elif attention_mask is not None:
+            lengths = PaddedBatch.from_mask(attention_mask).lengths
         else:
-            query_layer = _get_heads(query_layer, self.num_attention_heads) # (B, L, NH, head_dim)
-            key_layer = _get_heads(key_layer, self.num_attention_heads)
-            value_layer = _get_heads(value_layer, self.num_attention_heads)
+            lengths = None
 
-            # Convert 4D attention_mask [B, 1, L, L] to 2D [B, L] for _upad_input
-            if attention_mask.dim() == 4:
-                mask_2d = attention_mask[:, 0, :, :].sum(dim=-1) > 0
-            elif attention_mask.dim() == 3:
-                # [B, L, L] -> [B, L]
-                mask_2d = attention_mask.sum(dim=-1) > 0
-            else:
-                # Already 2D [B, L]
-                mask_2d = attention_mask
-
-            (query_layer,
-             key_layer,
-             value_layer,
-             _,
-             _,
-             indices_q,
-             cu_seq_lens,
-             max_seq_lens) = _upad_input(
-                query_layer,
-                key_layer,
-                value_layer,
-                None,
-                None,
-                mask_2d,
-                L,
-                self.num_attention_heads)
-
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-            out_unpad = flash_attention_with_disentangled_varlen(
-                query_layer,
-                key_layer,
-                value_layer,
-                pos_key_layer if "c2p" in self.pos_att_type else None,
-                pos_query_layer if "p2c" in self.pos_att_type else None,
-                cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_in_batch_q, max_seqlen_in_batch_k,
-                causal,
-                sm_scale,
-                self.position_buckets,
-                self.max_relative_positions,
-            )
-            out = pad_input(out_unpad, indices_q, B, L).view(B, L, self.all_head_size)
-            return (out, None)
+        B, L, _ = hidden_states.shape
+        out = flash_attention_with_disentangled(
+            _transform_for_scores(query_layer, self.num_attention_heads),  # (B, NH, L, head_dim)
+            _transform_for_scores(key_layer, self.num_attention_heads),
+            _transform_for_scores(value_layer, self.num_attention_heads),
+            lengths,
+            pos_key_layer, pos_query_layer,
+            False, sm_scale,
+            self.position_buckets,
+            self.max_relative_positions,
+            pos_key_index=pos_key_index,
+            pos_query_index=pos_query_index,
+            precision=self.attention_precision,
+        )
         out = out.view(B, self.num_attention_heads, L, self.attention_head_size).transpose(1, 2).reshape(B, L, self.all_head_size)
         return (out, None)
 
@@ -348,9 +304,90 @@ class FlashDebertaV2Layer(DebertaV2Layer):
 
 
 class FlashDebertaV2Encoder(DebertaV2Encoder):
+    """DeBERTa-v2 encoder that removes padding once and runs every layer on packed tokens.
+
+    The layout comes from ``packing.plan_batch``: packed for a 2D padding mask with padding when
+    ``config.unpad_inputs`` is true (default, read on every call), padded otherwise. 3D/4D masks,
+    ``query_states`` and batches without padding take the padded path. Under ``torch.compile`` the
+    packed size is rounded up to ``config.pack_bucket`` so graphs see fixed shapes.
+    """
+
     def __init__(self, config):
         super().__init__(config)
+        self.config = config
         self.layer = nn.ModuleList([FlashDebertaV2Layer(config) for _ in range(config.num_hidden_layers)])
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        output_hidden_states=True,
+        output_attentions=False,
+        query_states=None,
+        relative_pos=None,
+        return_dict=True,
+        batch=None,
+    ):
+        """``batch``: a ``PaddedBatch``/``PackedBatch`` from the model; built here when omitted.
+
+        With a pre-packed ``PackedBatch`` (no ``indices``), ``hidden_states`` is already (T, hidden)
+        and so is the output.
+        """
+        if batch is None:
+            batch = plan_batch(attention_mask, self.config, query_states,
+                               compiling=torch.compiler.is_compiling(), training=self.training)
+        if batch is not None and batch.packed and batch.indices is None and self.conv is not None:
+            raise NotImplementedError("pre-packed inputs are not supported with a convolution layer (conv_kernel_size)")
+
+        # Relative positions are computed inside the kernels, so the L x L `relative_pos`
+        # tensor of the original encoder is never built.
+        packed = batch is not None and batch.packed
+        if packed and batch.indices is not None and torch.compiler.is_compiling():
+            # Tell the compiler the (symbolic) packed size is aligned, as plan_batch guarantees.
+            torch._check(batch.indices.shape[0] % COMPILED_ROW_ALIGNMENT == 0)
+        layer_mask = batch if batch is not None else attention_mask
+        next_kv = batch.pack(hidden_states) if packed else hidden_states
+        unpack = batch.unpack if packed else (lambda x: x)
+
+        all_hidden_states = (hidden_states,) if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+        rel_embeddings = self.get_rel_embedding()
+
+        for i, layer_module in enumerate(self.layer):
+            output_states, attn_weights = layer_module(
+                next_kv,
+                layer_mask,
+                query_states=query_states,
+                relative_pos=relative_pos,
+                rel_embeddings=rel_embeddings,
+                output_attentions=output_attentions,
+            )
+            if output_attentions:
+                all_attentions = all_attentions + (attn_weights,)
+
+            if i == 0 and self.conv is not None:
+                # The convolution mixes neighbouring tokens, so it needs the padded layout.
+                input_mask = attention_mask if attention_mask.dim() <= 2 else attention_mask.sum(-2) > 0
+                output_states = self.conv(hidden_states, unpack(output_states), input_mask)
+                if packed:
+                    output_states = batch.pack(output_states)
+
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (unpack(output_states),)
+
+            if query_states is not None:
+                query_states = output_states
+                if isinstance(hidden_states, Sequence):
+                    next_kv = hidden_states[i + 1] if i + 1 < len(self.layer) else None
+            else:
+                next_kv = output_states
+
+        last_hidden_state = all_hidden_states[-1] if output_hidden_states else unpack(output_states)
+        if not return_dict:
+            return tuple(v for v in [last_hidden_state, all_hidden_states, all_attentions] if v is not None)
+        return BaseModelOutput(
+            last_hidden_state=last_hidden_state, hidden_states=all_hidden_states, attentions=all_attentions
+        )
 
 class FlashDebertaV2PreTrainedModel(PreTrainedModel):
     """
@@ -468,7 +505,28 @@ class FlashDebertaV2Model(FlashDebertaV2PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutput]:
+        """Standard DeBERTa-v2 forward, plus pre-packed inputs.
+
+        Pre-packed: ``input_ids`` (or ``inputs_embeds``) is (T, ...) holding sequences end to end,
+        ``cu_seqlens`` (B + 1,) bounds them and ``max_seqlen`` bounds their lengths; rows past
+        ``cu_seqlens[-1]`` are filler. Outputs are (T, hidden). ``packing.pack_inputs`` builds these.
+        There is no host read, so this runs under ``torch.compile(fullgraph=True)`` and CUDA graphs.
+        """
+        if cu_seqlens is not None:
+            return self._forward_packed(input_ids, token_type_ids, position_ids, inputs_embeds, cu_seqlens,
+                                        max_seqlen, output_hidden_states, return_dict)
+
+        # Layout first: packing reads the token count from the GPU. Under torch.compile that is the
+        # one graph break; doing it before anything else keeps the rest of the model one graph, with
+        # the sequence length and packed size symbolic (any batch reuses it).
+        batch = None
+        if self.z_steps <= 1 and attention_mask is not None:
+            batch = plan_batch(attention_mask, self.config, compiling=torch.compiler.is_compiling(),
+                               training=self.training, inputs=(input_ids, token_type_ids, position_ids, inputs_embeds))
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -489,8 +547,13 @@ class FlashDebertaV2Model(FlashDebertaV2PreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.ones(input_shape, device=device)
+            batch = PaddedBatch(torch.full(input_shape[:1], input_shape[1], dtype=torch.int32, device=device))
         if token_type_ids is None:
             token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+        if position_ids is None and self.embeddings.position_embeddings is None:
+            # Never read without position embeddings (DeBERTa-v3). Passing a tensor skips the slice of
+            # the 512-entry position buffer, which would tie compiled graphs to seq_len <= 512.
+            position_ids = token_type_ids
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
@@ -500,16 +563,20 @@ class FlashDebertaV2Model(FlashDebertaV2PreTrainedModel):
             inputs_embeds=inputs_embeds,
         )
 
+        # Hidden states of every layer are only needed when asked for or for z_steps; with packed
+        # inputs each one costs a re-padding copy.
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask,
-            output_hidden_states=True,
+            output_hidden_states=output_hidden_states or self.z_steps > 1,
             output_attentions=output_attentions,
-            return_dict=return_dict,
+            return_dict=True,
+            batch=batch,
         )
-        encoded_layers = encoder_outputs[1]
+        sequence_output = encoder_outputs.last_hidden_state
 
         if self.z_steps > 1:
+            encoded_layers = list(encoder_outputs.hidden_states)
             hidden_states = encoded_layers[-2]
             layers = [self.encoder.layer[-1] for _ in range(self.z_steps)]
             query_states = encoded_layers[-1]
@@ -526,16 +593,49 @@ class FlashDebertaV2Model(FlashDebertaV2PreTrainedModel):
                     rel_embeddings=rel_embeddings,
                 )
                 encoded_layers.append(query_states)
-
-        sequence_output = encoded_layers[-1]
+            sequence_output = encoded_layers[-1]
 
         if not return_dict:
-            return (sequence_output,) + encoder_outputs[(1 if output_hidden_states else 2) :]
+            extra = (encoder_outputs.hidden_states if output_hidden_states else None, encoder_outputs.attentions)
+            return (sequence_output,) + tuple(v for v in extra if v is not None)
 
         return BaseModelOutput(
             last_hidden_state=sequence_output,
             hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
             attentions=encoder_outputs.attentions,
+        )
+
+    def _forward_packed(self, input_ids, token_type_ids, position_ids, inputs_embeds, cu_seqlens, max_seqlen,
+                        output_hidden_states, return_dict):
+        if max_seqlen is None:
+            raise ValueError("pre-packed inputs need max_seqlen, an upper bound on the sequence lengths")
+        if self.z_steps > 1:
+            raise NotImplementedError("pre-packed inputs are not supported with z_steps > 1")
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        tokens = input_ids if input_ids is not None else inputs_embeds
+        batch = PackedBatch(cu_seqlens, max_seqlen, tokens.shape[0])
+        if position_ids is None and self.embeddings.position_biased_input:
+            position_ids = batch.token_positions()
+        add_batch_dim = lambda t: None if t is None else t.unsqueeze(0)
+        embedding_output = self.embeddings(
+            input_ids=add_batch_dim(input_ids),
+            token_type_ids=add_batch_dim(token_type_ids),
+            position_ids=add_batch_dim(position_ids),
+            mask=add_batch_dim(batch.token_mask()),
+            inputs_embeds=add_batch_dim(inputs_embeds),
+        )[0]
+        encoder_outputs = self.encoder(
+            embedding_output, None, output_hidden_states=output_hidden_states, return_dict=True, batch=batch,
+        )
+        if not return_dict:
+            extra = (encoder_outputs.hidden_states,) if output_hidden_states else ()
+            return (encoder_outputs.last_hidden_state,) + extra
+        return BaseModelOutput(
+            last_hidden_state=encoder_outputs.last_hidden_state,
+            hidden_states=encoder_outputs.hidden_states if output_hidden_states else None,
         )
 
 class FlashDebertaV2ForMaskedLM(FlashDebertaV2PreTrainedModel):

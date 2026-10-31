@@ -131,6 +131,79 @@ def test_varlen(dtype, B, L):
     assert_close(run(kernel, inputs, grad_out), run(dense, inputs, grad_out, torch.float64), dtype)
 
 
+def _varlen_case(lengths, L, dtype):
+    B = len(lengths)
+    inputs, _, grad_out = make_inputs(B, L, dtype, padded=False)
+    lengths = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    keep = torch.arange(L, device="cuda")[None, :] < lengths[:, None]
+    grad_out = grad_out * keep[:, None, :, None]
+    tokens = keep.flatten().nonzero().flatten()
+    cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+
+    def kernel(q, k, v, pk, pq):
+        pack = lambda t: t.transpose(1, 2).reshape(B * L, H, D)[tokens]
+        out = flash_attention_with_disentangled_varlen(pack(q), pack(k), pack(v), pk, pq, cu_seqlens, cu_seqlens,
+                                                       L, L, False, SM_SCALE, SPAN, MAX_REL)
+        full = torch.zeros(B * L, H, D, device="cuda", dtype=out.dtype).index_copy(0, tokens, out)
+        return full.view(B, L, H, D).transpose(1, 2)
+
+    def dense(q, k, v, pk, pq):
+        return reference(q, k, v, pk, pq, lengths, causal=False)
+
+    return inputs, grad_out, kernel, dense
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_varlen_tile_boundaries(dtype):
+    # Lengths on and around tile edges, including a single-token sequence.
+    inputs, grad_out, kernel, dense = _varlen_case([300, 1, 63, 64, 65, 129, 17], 300, dtype)
+    assert_close(run(kernel, inputs, grad_out), run(dense, inputs, grad_out, torch.float64), dtype)
+
+
+def test_varlen_has_no_host_sync():
+    L = 1100
+    q, k, v, pk, pq = (t.detach().requires_grad_() for t in make_inputs(3, L, torch.float16, padded=False)[0])
+    lengths = torch.tensor([L, 700, 333], device="cuda", dtype=torch.int32)
+    cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+    T = int(lengths.sum())
+    pack = lambda t: t.detach()[0, :, :T].transpose(0, 1).contiguous().requires_grad_()
+    q, k, v = pack(q), pack(k), pack(v)
+
+    def step():
+        out = flash_attention_with_disentangled_varlen(q, k, v, pk, pq, cu_seqlens, cu_seqlens,
+                                                       L, L, False, SM_SCALE, SPAN, MAX_REL)
+        out.backward(torch.ones_like(out))
+
+    _assert_no_host_sync(step)
+
+
+def _assert_no_host_sync(step):
+    step()  # first call builds and uploads the position plan
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        step()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("with_positions", [False, True])
+def test_fixed_length_has_no_host_sync(causal, with_positions):
+    B, L = 3, 700
+    (q, k, v, pk, pq), lengths, _ = make_inputs(B, L, torch.float16, padded=True)
+    q, k, v, pk, pq = (t.requires_grad_() for t in (q, k, v, pk, pq))
+    # Custom positions need an explicit span, otherwise their maximum is read back (documented sync).
+    extra = (torch.arange(L, device="cuda", dtype=torch.int32).expand(B, L).contiguous(), L) if with_positions else ()
+
+    def step():
+        out = flash_attention_with_disentangled(q, k, v, None if causal else lengths, pk, pq,
+                                                causal, SM_SCALE, SPAN, MAX_REL, *extra)
+        out.backward(torch.ones_like(out))
+
+    _assert_no_host_sync(step)
+
+
 @pytest.mark.parametrize("L", [16, 300, 2048])
 def test_position_plan_band_covers_every_distance(L):
     plan = position_plan(L, L, SPAN, MAX_REL, SPAN, "cuda")
@@ -287,3 +360,90 @@ def test_positions_are_validated():
     assert not positions_are_unique(duplicated)
     # A duplicate that sits in the padding does not count.
     assert positions_are_unique(duplicated, torch.tensor([4, 64], device="cuda"))
+
+
+def _per_sequence_case(B, L, dtype, num_tables, seed=0):
+    """Inputs with S position tables per term and a (B,) index picking each sequence's table."""
+    (q, k, v, _, _), _, _ = make_inputs(B, L, dtype, padded=False, seed=seed)
+    g = torch.Generator(device="cuda").manual_seed(seed + 1)
+    pk, pq = (torch.randn(num_tables, H, 2 * SPAN, D, device="cuda", dtype=dtype, generator=g) * 0.5 for _ in range(2))
+    index = torch.randint(0, num_tables, (B,), device="cuda", generator=g)
+    index[0] = num_tables - 1
+    lengths = torch.randint(L // 4, L + 1, (B,), device="cuda", dtype=torch.int32, generator=g)
+    lengths[0] = L
+    return q, k, v, pk, pq, index, lengths
+
+
+def _relative_error(a, b):
+    keep = b.abs().sum(-1, keepdim=True) > 0
+    return ((a.double() - b.double()) * keep).norm().item() / b.double().norm().item()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("B,L", [(3, 100), (5, 700)])
+@pytest.mark.parametrize("terms", ["c2p+p2c", "c2p", "p2c"])
+def test_per_sequence_position_tables(dtype, B, L, terms):
+    """Each sequence attends with its own C2P/P2C tables, in the padded and the packed kernel."""
+    q, k, v, pk, pq, index, lengths = _per_sequence_case(B, L, dtype, num_tables=3)
+    pk = pk if "c2p" in terms else None
+    pq = pq if "p2c" in terms else None
+    gather = lambda t: None if t is None else t[index].double()
+    expected = reference(q.double(), k.double(), v.double(), gather(pk), gather(pq), lengths, causal=False)
+
+    with torch.no_grad():
+        padded = flash_attention_with_disentangled(q, k, v, lengths, pk, pq, False, SM_SCALE, SPAN, MAX_REL,
+                                                   pos_key_index=index if pk is not None else None,
+                                                   pos_query_index=index if pq is not None else None)
+        keep = torch.arange(L, device="cuda")[None, :] < lengths[:, None]
+        tokens = keep.flatten().nonzero().flatten()
+        cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+        pack = lambda t: t.transpose(1, 2).reshape(B * L, H, D)[tokens]
+        out = flash_attention_with_disentangled_varlen(pack(q), pack(k), pack(v), pk, pq, cu_seqlens, cu_seqlens,
+                                                       L, L, False, SM_SCALE, SPAN, MAX_REL,
+                                                       pos_key_index=index if pk is not None else None,
+                                                       pos_query_index=index if pq is not None else None)
+        packed = torch.zeros(B * L, H, D, device="cuda", dtype=out.dtype).index_copy(0, tokens, out)
+        packed = packed.view(B, L, H, D).transpose(1, 2)
+
+    for name, got in (("padded", padded), ("packed", packed)):
+        err = _relative_error(got * keep[:, None, :, None], expected)
+        assert err < TOLERANCE[dtype], f"{name}: relative error {err:.2e}"
+
+
+def test_per_sequence_position_tables_reject_backward():
+    q, k, v, pk, pq, index, lengths = _per_sequence_case(2, 64, torch.float32, num_tables=2)
+    q.requires_grad_()
+    out = flash_attention_with_disentangled(q, k, v, lengths, pk, pq, False, SM_SCALE, SPAN, MAX_REL,
+                                            pos_key_index=index, pos_query_index=index)
+    with pytest.raises(NotImplementedError, match="per-sequence position tables"):
+        out.sum().backward()
+
+
+def test_per_sequence_position_tables_are_validated():
+    q, k, v, pk, pq, index, lengths = _per_sequence_case(2, 64, torch.float32, num_tables=2)
+    with pytest.raises(ValueError, match="index must have shape"):
+        flash_attention_with_disentangled(q, k, v, lengths, pk, None, False, SM_SCALE, SPAN, MAX_REL,
+                                          pos_key_index=index[:1])
+    with pytest.raises(ValueError, match="shared across the batch"):
+        flash_attention_with_disentangled(q, k, v, lengths, pk, None, False, SM_SCALE, SPAN, MAX_REL)
+
+
+@pytest.mark.parametrize("head_dim", [64, 24])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_segmented_position_scores(head_dim, dtype):
+    """Packed rows times their own sequence's table; head_dim 24 takes the PyTorch fallback."""
+    from flashdeberta.ops.flash_attention_varlen import _position_scores_per_sequence
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    lengths = torch.tensor([70, 1, 0, 130], device="cuda", dtype=torch.int32)
+    cu_seqlens = F.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+    rows = torch.randn(int(lengths.sum()), 3, head_dim, device="cuda", dtype=dtype, generator=g)
+    tables = torch.randn(2, 3, 100, head_dim, device="cuda", dtype=dtype, generator=g)
+    index = torch.tensor([1, 0, 1, 0], device="cuda")
+    got = _position_scores_per_sequence(rows, tables, index, cu_seqlens, 130)
+    expected = torch.cat([
+        torch.einsum("thd,hrd->thr", rows[s:e].double(), tables[index[b]].double())
+        for b, (s, e) in enumerate(zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()))
+    ])
+    err = ((got.double() - expected).norm() / expected.norm()).item()
+    assert err < TOLERANCE[dtype], f"relative error {err:.2e}"

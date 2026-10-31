@@ -28,8 +28,9 @@ import triton.language as tl
 
 from .config import forward_config, backward_configs
 from .launch import launch, clear_launch_cache
-from .position import (position_plan, position_table, fold_matrix, fold_band_gradients,
+from .position import (position_plan, position_table, per_sequence_tables, fold_matrix, fold_band_gradients,
                        clear_position_cache, prepare_positions)
+from .fp8 import fp8_quantize, quant_mode, quantize_rows
 
 def cdiv(a, b):
     return (a + b - 1) // b
@@ -38,7 +39,7 @@ def cdiv(a, b):
 def _fwd_kernel_deberta_disentangled_attention(
     Q, K, V,
     K_POS, Q_POS, POS_LUT, POSITIONS,
-    L, O,
+    L, O, QS, KS,
     SEQ_LENGTHS,
     sm_scale,
     stride_qz, stride_qh, stride_qm, stride_qk,
@@ -51,8 +52,9 @@ def _fwd_kernel_deberta_disentangled_attention(
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr, LARGER_M: tl.constexpr,
     HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr, HAS_POSITIONS: tl.constexpr,
+    QUANT: tl.constexpr = 0,
 ):
-    input_dtype = Q.dtype.element_ty
+    input_dtype = V.dtype.element_ty  # Q and K are fp8 when QUANT > 0
 
     start_m = tl.program_id(0)
     off_h   = tl.program_id(1)
@@ -89,6 +91,10 @@ def _fwd_kernel_deberta_disentangled_attention(
         pos_m = offs_m
 
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0, cache_modifier=".cg")
+    if QUANT > 0:
+        # Q and K arrive as fp8 rows with one fp32 scale per row (see quantize_rows).
+        q_scale = tl.load(QS + (off_z * H + off_h) * M + offs_m, mask=mask_m, other=0.0)
+        KS += (off_z * H + off_h) * N
 
     m_i = tl.full([BLOCK_M], value=-float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -113,7 +119,11 @@ def _fwd_kernel_deberta_disentangled_attention(
         k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0, cache_modifier=".cg")
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0, cache_modifier=".cg")
 
-        s = tl.dot(q, k)
+        if QUANT > 0:
+            k_scale = tl.load(KS + offs_n, mask=mask_n, other=0.0)
+            s = tl.dot(q, k) * (q_scale[:, None] * k_scale[None, :])
+        else:
+            s = tl.dot(q, k)
 
         if HAS_C2P or HAS_P2C:
             # Slot of every (query, key) pair from the distance lookup table.
@@ -140,7 +150,11 @@ def _fwd_kernel_deberta_disentangled_attention(
         alpha = tl.math.exp2(m_i - m_i_new)
         p = tl.math.exp2(s - m_i_new[:, None])
         acc *= alpha[:, None]
-        acc += tl.dot(p.to(input_dtype), v)
+        if QUANT == 2:
+            v8, v_scale = fp8_quantize(v, 0)
+            acc += tl.dot((p * 448.0).to(tl.float8e4nv), v8) * (v_scale[None, :] * (1.0 / 448.0))
+        else:
+            acc += tl.dot(p.to(input_dtype), v)
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
 
@@ -168,7 +182,8 @@ def get_fwd_config(B, H, M, N, D, causal, disentangled=False, max_shared_memory=
 
 
 def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, causal, sm_scale,
-                           BLOCK_M, BLOCK_N, num_warps, num_stages, positions=None, plan_n=None):
+                           BLOCK_M, BLOCK_N, num_warps, num_stages, positions=None, plan_n=None, quant=0,
+                           q_scale=None, k_scale=None):
     """
     Performs the forward pass of FlashAttention with DeBERTa-style disentangled relative attention.
 
@@ -208,7 +223,7 @@ def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, ca
     if plan_n is None:
         plan_n = N
 
-    o = torch.zeros_like(q)
+    o = torch.zeros_like(q, dtype=v.dtype)  # q is fp8 when quant > 0
     L = torch.zeros((B, H, M), device=q.device, dtype=torch.float32)
 
     stride_pk = pos_key.stride() if has_c2p else (0, 0, 0, 0)
@@ -217,7 +232,7 @@ def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, ca
     args = (
         q, k, v,
         pos_key, pos_query, pos_lut, positions,
-        L, o,
+        L, o, q_scale, k_scale,
         seq_lengths,
         sm_scale,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -229,11 +244,11 @@ def flash_attn_v2_fwd_dise(q, k, v, seq_lengths, pos_key, pos_query, pos_lut, ca
         B, H, M, N, P_SEQ, plan_n, positions.stride(0) if has_positions else 0,
     )
     kwargs = dict(BLOCK_DMODEL=D, IS_CAUSAL=causal, LARGER_M=M > N, HAS_C2P=has_c2p, HAS_P2C=has_p2c,
-                  HAS_POSITIONS=has_positions)
+                  HAS_POSITIONS=has_positions, QUANT=quant)
     with torch.cuda.device(q.device.index):
         launch(
             _fwd_kernel_deberta_disentangled_attention,
-            ("fwd", D, q.dtype, causal, has_c2p, has_p2c, has_positions),
+            ("fwd", D, q.dtype, causal, has_c2p, has_p2c, has_positions, quant),
             (BLOCK_M, BLOCK_N, num_stages, num_warps),
             lambda block_m, block_n: ((cdiv(M, block_m), H, B), args, kwargs),
         )
@@ -284,7 +299,7 @@ def _bwd_preprocess(
 def _bwd_kv_dise_kernel(
     Q, K, V, SEQ_LENGTHS, K_POS, Q_POS, POS_LUT, POSITIONS, sm_scale, DO,
     DK, DV, P2C_BAND,
-    L, Delta,
+    L, Delta, Q8, K8, QS, KS,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
@@ -298,6 +313,7 @@ def _bwd_kv_dise_kernel(
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
     HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr, HAS_POSITIONS: tl.constexpr,
+    QUANT: tl.constexpr = 0,
 ):
     input_dtype = Q.dtype.element_ty
     log2e: tl.constexpr = 1.4426950408889634
@@ -344,6 +360,10 @@ def _bwd_kv_dise_kernel(
         pos_n = offs_n
     k = tl.load(K + offs_n[:, None]*stride_kn + offs_k[None, :]*stride_kk, mask=mask_n[:, None], other=0.0)
     v = tl.load(V + offs_n[:, None]*stride_vn + offs_k[None, :]*stride_vk, mask=mask_n[:, None], other=0.0)
+    if QUANT > 0:
+        k8 = tl.load(K8 + off_z*stride_kz + off_h*stride_kh + offs_n[:, None]*stride_kn + offs_k[None, :]*stride_kk,
+                     mask=mask_n[:, None], other=0.0)
+        k_scale = tl.load(KS + (off_z*H + off_h)*N + offs_n, mask=mask_n, other=0.0)
 
     dk = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
@@ -367,7 +387,14 @@ def _bwd_kv_dise_kernel(
         l  = tl.load(L + offs_m, mask=mask_m, other=0.0)
         delta = tl.load(Delta + offs_m, mask=mask_m, other=0.0)
 
-        s = tl.dot(q, tl.trans(k))
+        if QUANT > 0:
+            # Same quantized scores as the forward, so P matches the saved LSE.
+            q8 = tl.load(Q8 + off_z*stride_qz + off_h*stride_qh + offs_m[:, None]*stride_qm + offs_k[None, :]*stride_qk,
+                         mask=mask_m[:, None], other=0.0)
+            q_scale = tl.load(QS + (off_z*H + off_h)*M + offs_m, mask=mask_m, other=0.0)
+            s = tl.dot(q8, tl.trans(k8)) * (q_scale[:, None] * k_scale[None, :])
+        else:
+            s = tl.dot(q, tl.trans(k))
 
         distance = pos_m[:, None] - pos_n[None, :] + PLAN_N - 1
         if HAS_C2P or HAS_P2C:
@@ -409,7 +436,7 @@ def _bwd_kv_dise_kernel(
 def _bwd_q_dise_kernel(
     Q, K, V, SEQ_LENGTHS, K_POS, Q_POS, POS_LUT, POSITIONS, sm_scale, DO,
     DQ, C2P_BAND,
-    L, Delta,
+    L, Delta, Q8, K8, QS, KS,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
@@ -421,6 +448,7 @@ def _bwd_q_dise_kernel(
     Z, H, M, N, P_SEQ, PLAN_N, stride_posz, BAND_LOW, NUM_COLUMNS,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr, HAS_C2P: tl.constexpr, HAS_P2C: tl.constexpr, HAS_POSITIONS: tl.constexpr,
+    QUANT: tl.constexpr = 0,
 ):
     input_dtype = Q.dtype.element_ty
     log2e: tl.constexpr = 1.4426950408889634
@@ -461,6 +489,10 @@ def _bwd_q_dise_kernel(
     do = tl.load(DO + offs_m[:, None]*stride_dom + offs_k[None, :]*stride_dok, mask=mask_m[:, None], other=0.0)
     delta = tl.load(Delta + offs_m, mask=mask_m, other=0.0)
     l = tl.load(L + offs_m, mask=mask_m, other=0.0)
+    if QUANT > 0:
+        q8 = tl.load(Q8 + off_z*stride_qz + off_h*stride_qh + offs_m[:, None]*stride_qm + offs_k[None, :]*stride_qk,
+                     mask=mask_m[:, None], other=0.0)
+        q_scale = tl.load(QS + (off_z*H + off_h)*M + offs_m, mask=mask_m, other=0.0)
 
     dq = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
     # C2P gradients of distances saturated into the first/last slot, per query row.
@@ -492,7 +524,13 @@ def _bwd_q_dise_kernel(
         k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0, cache_modifier=".cg")
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0, cache_modifier=".cg")
 
-        s = tl.dot(q, tl.trans(k))
+        if QUANT > 0:
+            k8 = tl.load(K8 + off_z*stride_kz + off_h*stride_kh + offs_n[:, None]*stride_kn + offs_k[None, :]*stride_kk,
+                         mask=mask_n[:, None], other=0.0)
+            k_scale = tl.load(KS + (off_z*H + off_h)*N + offs_n, mask=mask_n, other=0.0)
+            s = tl.dot(q8, tl.trans(k8)) * (q_scale[:, None] * k_scale[None, :])
+        else:
+            s = tl.dot(q, tl.trans(k))
 
         distance = pos_m[:, None] - pos_n[None, :] + PLAN_N - 1
         if HAS_C2P or HAS_P2C:
@@ -532,7 +570,8 @@ def _bwd_q_dise_kernel(
 
 
 def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal, sm_scale,
-                           pos_lut, band_low, num_columns, kv_config, q_config, positions=None, plan_n=None):
+                           pos_lut, band_low, num_columns, kv_config, q_config, positions=None, plan_n=None, quant=0,
+                           q8=None, k8=None, q_scale=None, k_scale=None):
     """
     Performs the backward pass of FlashAttention with DeBERTa-style disentangled relative attention.
 
@@ -597,7 +636,7 @@ def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal,
     kv_args = (
         q, k, v, seq_lengths, k_pos, q_pos, pos_lut, positions, sm_scale, do,
         dk, dv, p2c_band,
-        L, delta,
+        L, delta, q8, k8, q_scale, k_scale,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -612,7 +651,7 @@ def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal,
     q_args = (
         q, k, v, seq_lengths, k_pos, q_pos, pos_lut, positions, sm_scale, do,
         dq, c2p_band,
-        L, delta,
+        L, delta, q8, k8, q_scale, k_scale,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -623,8 +662,9 @@ def flash_attn_v2_bwd_dise(o, do, q, k, v, seq_lengths, k_pos, q_pos, L, causal,
         *stride_c2p_band,
         B, H, M, N, P_SEQ, plan_n, stride_posz, band_low, num_columns,
     )
-    kwargs = dict(BLOCK_DMODEL=D, CAUSAL=causal, HAS_C2P=has_c2p, HAS_P2C=has_p2c, HAS_POSITIONS=has_positions)
-    key = (D, q.dtype, causal, has_c2p, has_p2c, has_positions)
+    kwargs = dict(BLOCK_DMODEL=D, CAUSAL=causal, HAS_C2P=has_c2p, HAS_P2C=has_p2c, HAS_POSITIONS=has_positions,
+                  QUANT=quant)
+    key = (D, q.dtype, causal, has_c2p, has_p2c, has_positions, quant)
     with torch.cuda.device(q.device.index):
         launch(_bwd_kv_dise_kernel, ("bwd_kv",) + key, kv_config,
                lambda block_m, block_n: ((cdiv(N, block_n), H, B), kv_args, kwargs))
@@ -646,106 +686,116 @@ def _head_rows(layer):
     return layer.permute(1, 0, 2, 3).reshape(H, B * L, D)
 
 
-class FlashAttentionDisentangled(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal,
-                sm_scale, position_buckets, max_relative_distance, positions=None, position_span=None):
+def _plan(B, M, N, positions, position_span, position_buckets, max_relative_distance, device):
+    """Validated positions and the position plan of a (B, M) x (B, N) problem."""
+    att_span = position_buckets if position_buckets > 0 else max_relative_distance
+    # Custom positions: the plan covers every distance between two positions below ``plan_len``.
+    positions, plan_len = prepare_positions(positions, position_span, (B, M), N)
+    plan_shape = (M, N) if positions is None else (plan_len, plan_len)
+    plan = position_plan(*plan_shape, position_buckets, max_relative_distance, att_span, device)
+    return att_span, positions, plan_shape, plan
 
-        Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
-        assert Dq == Dk == Dv, "Query, key, and value must have the same head dimension"
 
-        B, H, M, D = q.shape
-        N = k.shape[2]
-        if sm_scale is None:
-            sm_scale = 1. / math.sqrt(D)
+def padded_forward(q, k, v, seq_lengths, pos_key_layer, pos_query_layer, pos_key_index, pos_query_index,
+                   positions, causal, sm_scale, position_buckets, max_relative_distance, position_span,
+                   precision="native"):
+    """Forward of the padded kernel: returns ``(o (B, H, M, D), lse (B, H, M) fp32)``."""
+    Dq, Dk, Dv = q.shape[-1], k.shape[-1], v.shape[-1]
+    assert Dq == Dk == Dv, "Query, key, and value must have the same head dimension"
+    B, H, M, D = q.shape
+    N = k.shape[2]
+    quant = quant_mode(precision, q.device)
+    ATT_SPAN, positions, (plan_m, plan_n), plan = _plan(
+        B, M, N, positions, position_span, position_buckets, max_relative_distance, q.device)
 
-        ATT_SPAN = position_buckets if position_buckets > 0 else max_relative_distance
-        # Custom positions: the plan covers every distance between two positions below ``plan_len``.
-        positions, plan_len = prepare_positions(positions, position_span, (B, M), N)
-        plan_m, plan_n = (M, N) if positions is None else (plan_len, plan_len)
-        plan = position_plan(plan_m, plan_n, position_buckets, max_relative_distance, ATT_SPAN, q.device)
+    # C2P/P2C scores are plain GEMMs; the kernel gathers them per (query, key) pair.
+    def scores(rows, layer, index):
+        if index is None:
+            table = position_table(layer, H, ATT_SPAN)                  # (H, R, D), shared
+        else:
+            table = per_sequence_tables(layer, index, H, ATT_SPAN, B)   # (B, H, R, D)
+        return torch.matmul(rows, table.transpose(-1, -2))
 
-        # C2P/P2C scores are plain GEMMs; the kernel gathers them per (query, key) pair.
-        pos_key = pos_query = None
-        if pos_key_layer is not None:
-            pos_key = torch.matmul(q, position_table(pos_key_layer, H, ATT_SPAN).transpose(-1, -2))
-        if pos_query_layer is not None:
-            pos_query = torch.matmul(k, position_table(pos_query_layer, H, ATT_SPAN).transpose(-1, -2))
+    pos_key = scores(q, pos_key_layer, pos_key_index) if pos_key_layer is not None else None
+    pos_query = scores(k, pos_query_layer, pos_query_index) if pos_query_layer is not None else None
 
-        BLOCK_M, BLOCK_N, num_stages, num_warps = get_fwd_config(
-            B, H, M, N, D, causal, disentangled=True, att_span=ATT_SPAN
-        )
+    BLOCK_M, BLOCK_N, num_stages, num_warps = get_fwd_config(
+        B, H, M, N, D, causal, disentangled=True, att_span=ATT_SPAN
+    )
+    q_scale = k_scale = None
+    if quant:
+        q, q_scale = quantize_rows(q)
+        k, k_scale = quantize_rows(k)
+    return flash_attn_v2_fwd_dise(
+        q, k, v, seq_lengths, pos_key, pos_query, plan.lut, causal, sm_scale,
+        BLOCK_M, BLOCK_N, num_warps, num_stages, positions, plan_n, quant, q_scale, k_scale,
+    )
 
-        o, L = flash_attn_v2_fwd_dise(
-            q, k, v, seq_lengths, pos_key, pos_query, plan.lut, causal, sm_scale,
-            BLOCK_M, BLOCK_N, num_warps, num_stages, positions, plan_n,
-        )
 
-        # Position scores are recomputed in backward instead of being kept alive.
-        ctx.save_for_backward(q, k, v, pos_key_layer, pos_query_layer, o, L)
-        ctx.seq_lengths = seq_lengths
-        ctx.sm_scale = sm_scale
-        ctx.causal = causal
-        ctx.position_buckets = position_buckets
-        ctx.max_relative_distance = max_relative_distance
-        ctx.ATT_SPAN = ATT_SPAN
-        ctx.positions = positions
-        ctx.plan_shape = (plan_m, plan_n)
-        return o
+def padded_backward(do, q, k, v, o, L, seq_lengths, pos_key_layer, pos_query_layer, positions, causal, sm_scale,
+                    position_buckets, max_relative_distance, position_span, precision="native"):
+    """Gradients ``(dq, dk, dv, d_pos_key_layer | None, d_pos_query_layer | None)`` of ``padded_forward``.
 
-    @staticmethod
-    def backward(ctx, do):
-        q, k, v, pos_key_layer, pos_query_layer, o, L = ctx.saved_tensors
-        causal = ctx.causal
-        ATT_SPAN = ctx.ATT_SPAN
-        B, H, M, D = q.shape
-        N = k.shape[2]
-        plan_m, plan_n = ctx.plan_shape
-        plan = position_plan(plan_m, plan_n, ctx.position_buckets, ctx.max_relative_distance, ATT_SPAN, q.device)
+    Position scores are recomputed instead of being kept alive from the forward.
+    """
+    B, H, M, D = q.shape
+    N = k.shape[2]
+    quant = quant_mode(precision, q.device)
+    ATT_SPAN, positions, (plan_m, plan_n), plan = _plan(
+        B, M, N, positions, position_span, position_buckets, max_relative_distance, q.device)
+    fp8 = (None, None, None, None)
+    if quant:
+        # Scores are recomputed from the same fp8 rows as the forward; the fp8 copies share q/k strides.
+        q, k = q.contiguous(), k.contiguous()
+        (q8, q_scale), (k8, k_scale) = quantize_rows(q), quantize_rows(k)
+        fp8 = (q8, k8, q_scale, k_scale)
 
-        pos_key = pos_query = None
-        if pos_key_layer is not None:
-            key_table = position_table(pos_key_layer, H, ATT_SPAN)
-            pos_key = torch.matmul(q, key_table.transpose(-1, -2))
-        if pos_query_layer is not None:
-            query_table = position_table(pos_query_layer, H, ATT_SPAN)
-            pos_query = torch.matmul(k, query_table.transpose(-1, -2))
+    pos_key = pos_query = None
+    if pos_key_layer is not None:
+        key_table = position_table(pos_key_layer, H, ATT_SPAN)
+        pos_key = torch.matmul(q, key_table.transpose(-1, -2))
+    if pos_query_layer is not None:
+        query_table = position_table(pos_query_layer, H, ATT_SPAN)
+        pos_query = torch.matmul(k, query_table.transpose(-1, -2))
 
-        kv_config, q_config = get_bwd_config(
-            B, H, M, N, D, causal,
-            disentangled=(pos_key is not None or pos_query is not None),
-            att_span=ATT_SPAN,
-            dtype=q.dtype
-        )
+    kv_config, q_config = get_bwd_config(
+        B, H, M, N, D, causal,
+        disentangled=(pos_key is not None or pos_query is not None),
+        att_span=ATT_SPAN,
+        dtype=q.dtype
+    )
 
-        do = do.contiguous() if do.stride(-1) != 1 else do
-        dq, dk, dv, c2p_band, p2c_band = flash_attn_v2_bwd_dise(
-            o, do, q, k, v, ctx.seq_lengths, pos_key, pos_query, L, causal, ctx.sm_scale,
-            plan.lut, plan.band_low, plan.num_columns, kv_config, q_config, ctx.positions, plan_n,
-        )
+    do = do.contiguous() if do.stride(-1) != 1 else do
+    dq, dk, dv, c2p_band, p2c_band = flash_attn_v2_bwd_dise(
+        o, do, q, k, v, seq_lengths, pos_key, pos_query, L, causal, sm_scale,
+        plan.lut, plan.band_low, plan.num_columns, kv_config, q_config, positions, plan_n, quant, *fp8,
+    )
 
-        d_pos_key_layer = d_pos_query_layer = None
-        if c2p_band is not None or p2c_band is not None:
-            fold = fold_matrix(plan_m, plan_n, ctx.position_buckets, ctx.max_relative_distance, ATT_SPAN, q.device, q.dtype)
-        if c2p_band is not None:
-            grad_rows, grad_table = fold_band_gradients(
-                c2p_band.view(H, B * M, -1), _head_rows(q), key_table, fold.flip(0))
-            dq = dq + grad_rows.view(H, B, M, D).permute(1, 0, 2, 3)
-            d_pos_key_layer = grad_table.view(pos_key_layer.shape)
-        if p2c_band is not None:
-            grad_rows, grad_table = fold_band_gradients(
-                p2c_band.view(H, B * N, -1), _head_rows(k), query_table, fold)
-            dk = dk + grad_rows.view(H, B, N, D).permute(1, 0, 2, 3)
-            d_pos_query_layer = grad_table.view(pos_query_layer.shape)
-
-        return dq, dk, dv, None, d_pos_key_layer, d_pos_query_layer, None, None, None, None, None, None
+    d_pos_key_layer = d_pos_query_layer = None
+    if c2p_band is not None or p2c_band is not None:
+        fold = fold_matrix(plan_m, plan_n, position_buckets, max_relative_distance, ATT_SPAN, q.device, q.dtype)
+    if c2p_band is not None:
+        grad_rows, grad_table = fold_band_gradients(
+            c2p_band.view(H, B * M, -1), _head_rows(q), key_table, fold.flip(0))
+        dq = dq + grad_rows.view(H, B, M, D).permute(1, 0, 2, 3)
+        d_pos_key_layer = grad_table.view(pos_key_layer.shape)
+    if p2c_band is not None:
+        grad_rows, grad_table = fold_band_gradients(
+            p2c_band.view(H, B * N, -1), _head_rows(k), query_table, fold)
+        dk = dk + grad_rows.view(H, B, N, D).permute(1, 0, 2, 3)
+        d_pos_query_layer = grad_table.view(pos_query_layer.shape)
+    return dq, dk, dv, d_pos_key_layer, d_pos_query_layer
 
 
 def flash_attention_with_disentangled(q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal=False,
                                       sm_scale=None, position_buckets=0, max_relative_distance=0,
-                                      positions=None, position_span=None):
+                                      positions=None, position_span=None, pos_key_index=None, pos_query_index=None,
+                                      precision="native"):
     """
     Exact DeBERTa disentangled attention.
+
+    Runs as the ``flashdeberta::attn_fwd`` custom op, so it works under ``torch.compile`` and in
+    CUDA graphs, with a registered backward.
 
     Args:
         q, k, v: (B, H, L, D)
@@ -756,7 +806,16 @@ def flash_attention_with_disentangled(q, k, v, seq_lengths, pos_key_layer, pos_q
             ``positions[i] - positions[j]`` instead of ``i - j``, e.g. ``row * stride + column`` for an image
             grid. Positions must be unique inside a sequence and lie in ``[0, position_span)``.
         position_span: exclusive upper bound of ``positions``; read from the tensor when omitted (one sync).
+        pos_key_index / pos_query_index: optional (B,) table of every sequence. The matching layer is then
+            (S, H, 2 * ATT_SPAN, D): S tables, e.g. one per LoRA adapter. Inference only.
+        precision: "native" (the input dtype), "fp8_qk" (QK^T in FP8) or "fp8_qkv" (QK^T and PV in FP8).
+            FP8 quantizes inside the kernel; the backward uses the same scores and passes gradients
+            straight through the quantization.
     """
-    return FlashAttentionDisentangled.apply(q, k, v, seq_lengths, pos_key_layer, pos_query_layer, causal,
-                                            sm_scale, position_buckets, max_relative_distance,
-                                            positions, position_span)
+    from .library import attn_fwd
+    if sm_scale is None:
+        sm_scale = 1. / math.sqrt(q.shape[-1])
+    o, _ = attn_fwd(q, k, v, seq_lengths, pos_key_layer, pos_query_layer, pos_key_index, pos_query_index,
+                    positions, causal, float(sm_scale), int(position_buckets), int(max_relative_distance),
+                    None if position_span is None else int(position_span), precision)
+    return o
